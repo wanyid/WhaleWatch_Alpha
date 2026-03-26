@@ -3,6 +3,7 @@ truthbrush>=0.1.0
 yfinance>=0.2.0
 py-clob-client>=0.34.0
 requests>=2.31.0
+alpaca-py>=0.29.0
 
 # LLM providers
 anthropic>=0.40.0
