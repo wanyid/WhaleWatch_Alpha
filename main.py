@@ -28,7 +28,8 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from collections import deque
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Union
 
 import yaml
@@ -74,33 +75,165 @@ def _l2_min_confidence() -> float:
 
 
 # ---------------------------------------------------------------------------
+# Signal deduplication — prevent re-processing the same event twice
+# ---------------------------------------------------------------------------
+
+class SignalDeduper:
+    """Tracks recently processed signals to prevent duplicate pipeline runs.
+
+    Polymarket: dedups by (market_id, direction) — the same market moving in
+    the same direction within `ttl_minutes` is considered a duplicate.
+    Truth Social: dedups by post_id.
+    """
+
+    def __init__(self, ttl_minutes: int = 30) -> None:
+        self._ttl = timedelta(minutes=ttl_minutes)
+        self._poly: dict[str, datetime] = {}  # key: f"{market_id}:{direction}"
+        self._ts: set[str] = set()
+        self._ts_times: dict[str, datetime] = {}
+
+    def _prune(self) -> None:
+        now = datetime.now(tz=timezone.utc)
+        stale = [k for k, t in self._poly.items() if now - t > self._ttl]
+        for k in stale:
+            del self._poly[k]
+        stale_ts = [pid for pid, t in self._ts_times.items() if now - t > self._ttl]
+        for pid in stale_ts:
+            self._ts.discard(pid)
+            del self._ts_times[pid]
+
+    def is_duplicate(self, raw: Union["PolymarketRawEvent", "TruthSocialRawEvent"]) -> bool:
+        self._prune()
+        now = datetime.now(tz=timezone.utc)
+        from models.raw_events import PolymarketRawEvent, TruthSocialRawEvent
+        if isinstance(raw, PolymarketRawEvent):
+            key = f"{raw.market_id}:{getattr(raw, 'direction', '')}"
+            if key in self._poly:
+                return True
+            self._poly[key] = now
+            return False
+        elif isinstance(raw, TruthSocialRawEvent):
+            if raw.post_id in self._ts:
+                return True
+            self._ts.add(raw.post_id)
+            self._ts_times[raw.post_id] = now
+            return False
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Dual-signal matcher — detect when Poly + TS fire on the same theme
+# ---------------------------------------------------------------------------
+
+class DualSignalMatcher:
+    """Buffer of recent raw events from each scanner.
+
+    When an event arrives, checks if the opposite scanner recently emitted an
+    event sharing ≥ 1 keyword. If so, marks the current SignalEvent as
+    dual_signal=True and enriches it with the other signal's data.
+
+    Buffer TTL: 15 minutes — if both signals fired within that window, they
+    likely reflect the same news event.
+    """
+
+    _TTL = timedelta(minutes=15)
+
+    def __init__(self) -> None:
+        self._poly_buf: deque = deque(maxlen=50)  # (event, timestamp)
+        self._ts_buf: deque = deque(maxlen=50)
+
+    def _prune_buf(self, buf: deque) -> None:
+        now = datetime.now(tz=timezone.utc)
+        while buf and now - buf[0][1] > self._TTL:
+            buf.popleft()
+
+    def _keywords(self, raw) -> set[str]:
+        from models.raw_events import PolymarketRawEvent, TruthSocialRawEvent
+        if isinstance(raw, TruthSocialRawEvent):
+            return {kw.lower() for kw in (raw.keywords or [])}
+        if isinstance(raw, PolymarketRawEvent):
+            # Extract keywords from market question
+            q = (raw.market_question or "").lower()
+            return {w for w in q.split() if len(w) > 4}
+        return set()
+
+    def record_and_match(
+        self, raw
+    ) -> tuple[bool, Optional[object]]:
+        """Record a raw event and return (dual_signal, matching_other_event).
+
+        Returns (True, matching_event) if there's a recent cross-signal match,
+        (False, None) otherwise.
+        """
+        from models.raw_events import PolymarketRawEvent, TruthSocialRawEvent
+        now = datetime.now(tz=timezone.utc)
+        kws = self._keywords(raw)
+        match = None
+
+        if isinstance(raw, PolymarketRawEvent):
+            self._prune_buf(self._ts_buf)
+            for other, _ in self._ts_buf:
+                if kws & self._keywords(other):
+                    match = other
+                    break
+            self._poly_buf.append((raw, now))
+        elif isinstance(raw, TruthSocialRawEvent):
+            self._prune_buf(self._poly_buf)
+            for other, _ in self._poly_buf:
+                if kws & self._keywords(other):
+                    match = other
+                    break
+            self._ts_buf.append((raw, now))
+
+        return (match is not None), match
+
+
+# ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 
 def _build_signal_event(
     raw: Union[PolymarketRawEvent, TruthSocialRawEvent],
+    dual_companion: Optional[Union[PolymarketRawEvent, TruthSocialRawEvent]] = None,
 ) -> SignalEvent:
-    """Wrap a raw scanner event in a fresh SignalEvent."""
+    """Wrap a raw scanner event in a fresh SignalEvent.
+
+    If dual_companion is supplied (the other scanner's matching event), the
+    SignalEvent is populated with both A and B signal data and dual_signal=True.
+    """
     now = datetime.now(tz=timezone.utc)
     ev = SignalEvent(
         event_id=str(uuid.uuid4()),
         created_at=now,
     )
+
+    def _fill_poly(e: PolymarketRawEvent) -> None:
+        ev.poly_market_id = e.market_id
+        ev.poly_market_slug = e.market_slug
+        ev.poly_market_question = e.market_question
+        ev.poly_outcome_token = e.outcome_token
+        ev.poly_price_before = e.price_before
+        ev.poly_price_after = e.price_after
+        ev.poly_price_delta = e.price_delta
+        ev.poly_volume_24h = e.volume_24h
+        ev.poly_volume_spike_pct = e.volume_spike_pct
+
+    def _fill_ts(e: TruthSocialRawEvent) -> None:
+        ev.ts_post_id = e.post_id
+        ev.ts_post_content = e.content
+        ev.ts_post_timestamp = e.posted_at
+        ev.ts_post_keywords = e.keywords
+
     if isinstance(raw, PolymarketRawEvent):
-        ev.poly_market_id = raw.market_id
-        ev.poly_market_slug = raw.market_slug
-        ev.poly_market_question = raw.market_question
-        ev.poly_outcome_token = raw.outcome_token
-        ev.poly_price_before = raw.price_before
-        ev.poly_price_after = raw.price_after
-        ev.poly_price_delta = raw.price_delta
-        ev.poly_volume_24h = raw.volume_24h
-        ev.poly_volume_spike_pct = raw.volume_spike_pct
+        _fill_poly(raw)
+        if isinstance(dual_companion, TruthSocialRawEvent):
+            _fill_ts(dual_companion)
     elif isinstance(raw, TruthSocialRawEvent):
-        ev.ts_post_id = raw.post_id
-        ev.ts_post_content = raw.content
-        ev.ts_post_timestamp = raw.posted_at
-        ev.ts_post_keywords = raw.keywords
+        _fill_ts(raw)
+        if isinstance(dual_companion, PolymarketRawEvent):
+            _fill_poly(dual_companion)
+
+    ev.dual_signal = dual_companion is not None
     return ev
 
 
@@ -110,10 +243,11 @@ def run_pipeline(
     l2: StatPredictor,
     risk: RiskManager,
     executor: PaperExecutor,
+    dual_companion: Optional[Union[PolymarketRawEvent, TruthSocialRawEvent]] = None,
 ) -> Optional[str]:
     """Run one raw event through the full pipeline. Returns order_id or None."""
-    # Build SignalEvent
-    event = _build_signal_event(raw)
+    # Build SignalEvent (with dual-signal enrichment if companion present)
+    event = _build_signal_event(raw, dual_companion)
 
     # --- Layer 1: LLM direction + ticker ---
     try:
@@ -172,6 +306,47 @@ def _scanner_thread(
 # Modes
 # ---------------------------------------------------------------------------
 
+def _run_true_news_check(executor: "PaperExecutor", market_provider: "YFinanceProvider") -> None:
+    """Fetch current Polymarket prices for open positions and apply True News Stop.
+
+    Queries the CLOB API for the latest price on each open position's poly_market_id.
+    If the probability has moved further in the signal direction (fade invalidated), exit.
+    """
+    try:
+        import requests
+
+        open_positions = executor.open_positions()
+        market_ids = list({p.get("poly_market_id") for p in open_positions
+                           if p.get("poly_market_id")})
+        if not market_ids:
+            return
+
+        session = requests.Session()
+        session.headers.update({"Accept": "application/json"})
+        CLOB_BASE = "https://clob.polymarket.com"
+
+        for market_id in market_ids:
+            try:
+                resp = session.get(
+                    f"{CLOB_BASE}/last-trade-price",
+                    params={"token_id": market_id},
+                    timeout=5,
+                )
+                if resp.ok:
+                    price_data = resp.json()
+                    current_prob = float(price_data.get("price", 0))
+                    closed = executor.check_true_news_stop(market_id, current_prob)
+                    if closed:
+                        logger.info(
+                            "True News Stop: closed %d position(s) for market %s (prob=%.3f)",
+                            len(closed), market_id[:12], current_prob,
+                        )
+            except Exception as exc:
+                logger.debug("True news check failed for %s: %s", market_id[:12], exc)
+    except Exception as exc:
+        logger.debug("_run_true_news_check error: %s", exc)
+
+
 def run_live(once: bool = False) -> None:
     """Live paper-trading mode."""
     market_provider = YFinanceProvider()
@@ -209,6 +384,8 @@ def run_live(once: bool = False) -> None:
 
     raw_queue: queue.Queue = queue.Queue()
     stop_event = threading.Event()
+    deduper = SignalDeduper(ttl_minutes=30)
+    dual_matcher = DualSignalMatcher()
 
     # Graceful shutdown on Ctrl-C / SIGTERM
     def _handle_signal(sig, frame):
@@ -218,12 +395,12 @@ def run_live(once: bool = False) -> None:
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
-    # Start scanner threads
-    threads = []
+    # Track scanner→thread mapping for watchdog restarts
+    scanner_threads: list[dict] = []
     for sc in scanners:
         t = threading.Thread(target=_scanner_thread, args=(sc, raw_queue, stop_event), daemon=True)
         t.start()
-        threads.append(t)
+        scanner_threads.append({"scanner": sc, "thread": t, "started_at": time.time()})
 
     logger.info("WhaleWatch_Alpha running — %d scanner(s) active", len(scanners))
 
@@ -234,7 +411,19 @@ def run_live(once: bool = False) -> None:
         # Process queued events
         try:
             raw = raw_queue.get(timeout=1.0)
-            order_id = run_pipeline(raw, l1, l2, risk, executor)
+
+            # Deduplication check
+            if deduper.is_duplicate(raw):
+                logger.debug("Duplicate signal skipped: %s", type(raw).__name__)
+                continue
+
+            # Dual-signal detection
+            is_dual, companion = dual_matcher.record_and_match(raw)
+            if is_dual:
+                logger.info("Dual signal detected — enriching event with both A + B data")
+
+            order_id = run_pipeline(raw, l1, l2, risk, executor,
+                                    dual_companion=companion)
             if order_id:
                 logger.info("New position opened: order=%s", order_id[:8])
         except queue.Empty:
@@ -242,13 +431,18 @@ def run_live(once: bool = False) -> None:
         except Exception as exc:
             logger.error("Pipeline error: %s", exc, exc_info=True)
 
-        # Periodic sweep of expired positions
+        # Periodic sweep
         now = time.time()
         if now - last_sweep >= sweep_interval:
+            # 1. Close expired positions (time-based)
             closed = executor.close_expired_positions()
             if closed:
                 logger.info("Swept %d expired position(s)", closed)
-            # Log session summary periodically
+
+            # 2. True News Stop — check open Poly positions against latest prices
+            _run_true_news_check(executor, market_provider)
+
+            # 3. Session summary
             summary = executor.session_summary()
             logger.info(
                 "Session P&L: %.4f  trades=%d  wins=%d  win_rate=%.1f%%",
@@ -257,14 +451,30 @@ def run_live(once: bool = False) -> None:
                 summary["win_count"],
                 summary["win_rate"] * 100,
             )
+
+            # 4. Scanner watchdog — restart crashed threads
+            for entry in scanner_threads:
+                t = entry["thread"]
+                if not t.is_alive() and not stop_event.is_set():
+                    sc = entry["scanner"]
+                    logger.warning("Scanner %s thread died — restarting", sc.name())
+                    new_t = threading.Thread(
+                        target=_scanner_thread,
+                        args=(sc, raw_queue, stop_event),
+                        daemon=True,
+                    )
+                    new_t.start()
+                    entry["thread"] = new_t
+                    entry["started_at"] = time.time()
+
             last_sweep = now
 
         if once:
             stop_event.set()
 
     logger.info("Main loop exited — waiting for scanner threads")
-    for t in threads:
-        t.join(timeout=5)
+    for entry in scanner_threads:
+        entry["thread"].join(timeout=5)
     logger.info("WhaleWatch_Alpha stopped cleanly")
 
 

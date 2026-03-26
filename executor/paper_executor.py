@@ -53,7 +53,9 @@ CREATE TABLE IF NOT EXISTS positions (
     realized_pnl        REAL,
     outcome             TEXT,           -- WIN | LOSS | STOP_OUT | OPEN
     closed_at           TEXT,
-    close_reason        TEXT
+    close_reason        TEXT,
+    poly_market_id      TEXT,           -- for True News Stop tracking
+    poly_entry_prob     REAL            -- poly_price_after at signal time (fade baseline)
 );
 
 CREATE TABLE IF NOT EXISTS daily_pnl (
@@ -88,8 +90,8 @@ class PaperExecutor(BaseExecutor):
                 INSERT INTO positions
                   (order_id, event_id, created_at, signal_direction, signal_ticker,
                    confidence, holding_period_min, stop_loss_pct, take_profit_pct,
-                   entry_price, outcome)
-                VALUES (?,?,?,?,?,?,?,?,?,?,'OPEN')
+                   entry_price, outcome, poly_market_id, poly_entry_prob)
+                VALUES (?,?,?,?,?,?,?,?,?,?,'OPEN',?,?)
                 """,
                 (
                     order_id,
@@ -102,6 +104,8 @@ class PaperExecutor(BaseExecutor):
                     event.stop_loss_pct,
                     event.take_profit_pct,
                     entry_price,
+                    event.poly_market_id,
+                    event.poly_price_after,
                 ),
             )
 
@@ -190,6 +194,46 @@ class PaperExecutor(BaseExecutor):
         cols = ["order_id", "event_id", "direction", "ticker", "entry_price", "hold_min", "created_at"]
         return [dict(zip(cols, r)) for r in rows]
 
+    def check_true_news_stop(self, market_id: str, current_prob: float) -> list[str]:
+        """Apply the 'True News' stop for open positions tied to a Polymarket market.
+
+        The mean-reversion / fade thesis is invalidated when Polymarket probability
+        continues moving WITH the original signal direction after entry:
+
+          BUY signal originated from a falling poly prob → if prob falls further
+          (current_prob < poly_entry_prob), the news stuck and fade is wrong → EXIT.
+
+          SHORT signal originated from a rising poly prob → if prob rises further
+          (current_prob > poly_entry_prob) → EXIT.
+
+        Returns list of order_ids that were closed with reason="TRUE_NEWS_STOP".
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT order_id, signal_direction, poly_entry_prob "
+                "FROM positions "
+                "WHERE outcome='OPEN' AND poly_market_id=?",
+                (market_id,),
+            ).fetchall()
+
+        closed_ids: list[str] = []
+        for order_id, direction, entry_prob in rows:
+            if entry_prob is None:
+                continue
+            triggered = (
+                direction == "BUY" and current_prob < entry_prob   # fade invalidated
+                or direction == "SHORT" and current_prob > entry_prob
+            )
+            if triggered:
+                self.close_position(order_id, reason="TRUE_NEWS_STOP")
+                closed_ids.append(order_id)
+                logger.info(
+                    "TRUE_NEWS_STOP order=%s  direction=%s  entry_prob=%.3f  current=%.3f",
+                    order_id[:8], direction, entry_prob, current_prob,
+                )
+
+        return closed_ids
+
     def session_summary(self) -> dict:
         """Return today's P&L summary."""
         today = datetime.now(tz=timezone.utc).date().isoformat()
@@ -272,6 +316,20 @@ class PaperExecutor(BaseExecutor):
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
         with self._conn() as conn:
             conn.executescript(_DDL)
+        self._migrate_db()
+
+    def _migrate_db(self) -> None:
+        """Add columns that didn't exist in earlier schema versions."""
+        new_cols = [
+            ("poly_market_id", "TEXT"),
+            ("poly_entry_prob", "REAL"),
+        ]
+        with self._conn() as conn:
+            for col, col_type in new_cols:
+                try:
+                    conn.execute(f"ALTER TABLE positions ADD COLUMN {col} {col_type}")
+                except Exception:
+                    pass  # column already exists
 
     def _conn(self) -> sqlite3.Connection:
         return sqlite3.connect(self._db_path)

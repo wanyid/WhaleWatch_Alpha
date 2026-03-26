@@ -11,10 +11,53 @@ Feature groups:
   - L1 output encoding (direction × ticker)
 """
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
 from models.signal_event import SignalEvent
+
+# ---------------------------------------------------------------------------
+# VIX regime context — loaded once at import time from stored daily parquet
+# ---------------------------------------------------------------------------
+_VIX_DAILY: pd.Series | None = None
+_VIX_ROLLING_252: pd.Series | None = None
+
+def _load_vix() -> None:
+    global _VIX_DAILY, _VIX_ROLLING_252
+    vix_path = Path("D:/WhaleWatch_Data/equity/VIX_1d.parquet")
+    if not vix_path.exists():
+        return
+    try:
+        df = pd.read_parquet(vix_path)
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index, utc=True)
+        elif df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        close_col = "Close" if "Close" in df.columns else df.columns[3]
+        _VIX_DAILY = df[close_col].sort_index()
+        _VIX_ROLLING_252 = _VIX_DAILY.rank(pct=True).rolling(252, min_periods=10).mean()
+    except Exception:
+        pass
+
+_load_vix()
+
+
+def _vix_at(ts: pd.Timestamp) -> tuple[float, float]:
+    """Return (vix_level, vix_percentile) at the given timestamp.
+
+    vix_level: raw VIX close value (e.g. 18.5)
+    vix_percentile: rolling 252-day rank (0=historically low, 1=historically high)
+    """
+    if _VIX_DAILY is None:
+        return 0.0, 0.0
+    mask = _VIX_DAILY.index <= ts
+    if not mask.any():
+        return 0.0, 0.0
+    level = float(_VIX_DAILY[mask].iloc[-1])
+    pct = float(_VIX_ROLLING_252[mask].iloc[-1]) if _VIX_ROLLING_252 is not None else 0.0
+    return level, pct if not np.isnan(pct) else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +84,10 @@ FEATURE_NAMES = [
     "day_of_week",              # 0=Mon … 6=Sun
     "is_us_market_hours",       # 1 if 13:30–20:00 UTC (9:30–16:00 ET)
     "is_premarket",             # 1 if 08:00–13:30 UTC
+
+    # Market regime at signal time (from CLAUDE.md feature spec)
+    "vix_level",                # VIX close price at signal time (0 if unavailable)
+    "vix_percentile",           # VIX rank in trailing 252-day window (0–1)
 
     # L1 signal encoding (one-hot style but kept as individual features)
     "direction_buy",            # 1 if BUY
@@ -83,6 +130,10 @@ def build_feature_vector(event: SignalEvent) -> np.ndarray:
     is_market = int(dt.hour * 60 + dt.minute >= 810 and dt.hour * 60 + dt.minute < 1200)
     is_pre = int(dt.hour * 60 + dt.minute >= 480 and dt.hour * 60 + dt.minute < 810)
 
+    # ------ VIX regime ------
+    ts = pd.Timestamp(dt).tz_localize("UTC") if dt.tzinfo is None else pd.Timestamp(dt)
+    vix_level, vix_pct = _vix_at(ts)
+
     # ------ L1 encoding ------
     direction = (event.signal_direction or "HOLD").upper()
     ticker = (event.signal_ticker or "SPY").upper()
@@ -101,6 +152,8 @@ def build_feature_vector(event: SignalEvent) -> np.ndarray:
         dow,
         is_market,
         is_pre,
+        vix_level,
+        vix_pct,
         int(direction == "BUY"),
         int(direction == "SHORT"),
         int(ticker == "SPY"),
