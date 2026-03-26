@@ -278,3 +278,145 @@ python scripts/pull_historical_data.py
 - [ ] Train Layer 2 once ≥10 labeled events exist (`stat_predictor.py` `fit()` method)
 - [ ] Add ANTHROPIC_API_KEY to `.env` and do an end-to-end `python main.py --once` smoke test
 - [ ] Monitor paper trading session when market opens
+
+---
+
+## Session 4 — 2026-03-26
+
+### Participants
+- User (Quantitative Developer)
+- Claude Sonnet 4.6 (AI pair programmer)
+
+---
+
+### Key Work Completed
+
+#### Morning: Truth Social L2 Pipeline — Fixed + Trained
+
+| Area | Decision / Fix | Rationale |
+|------|---------------|-----------|
+| Label method | Excess return vs 20-post rolling baseline (dead-zone filtered) | Isolates post-driven alpha from SPY drift; removes ambiguous near-zero moves |
+| Training labels | Measured SPY price reactions (not LLM output) | Objective ground truth; avoids baking LLM subjectivity into training |
+| Dead zone | Period-specific thresholds (5m: ±0.10% → 1d: ±0.80%) | Drops 70–86% of rows where post-attribution is unclear |
+| Model architecture | XGBoost + isotonic calibration (replaces LogisticRegression) | XGBoost handles non-linear VIX × day-of-week interactions; isotonic calibration gives well-calibrated probabilities |
+| CV method | TimeSeriesSplit 5-fold (no lookahead) | Prevents future data leaking into training folds |
+| Timezone bug (fixed) | Intraday offsets anchored from actual entry bar timestamp, not hardcoded 13:30 UTC | EST/EDT shift caused 90%+ of T+5m returns to = 0 |
+| Post filter | Keyword-bearing posts only (`--min-keywords 1`) | AUC 0.60 → 0.64 for 1d by removing golf/endorsement posts |
+| Regime split | Separate high-VIX (≥20) and low-VIX (<20) models | Intraday signal quality collapses in crisis periods |
+| Decay weighting | 180-day half-life option | Modest benefit for 4h; neutral elsewhere |
+| Polygon.io | Used for SPY/QQQ/VIXY 5m + 1h (Jan 2025 → present) | yfinance 5m limited to 60 days — insufficient for full training window |
+
+**Truth Social L2 Model Results (trained on 2,207 posts, Jan 21 2025 → Mar 25 2026):**
+
+| Period | Baseline AUC | Best model | Best AUC |
+|--------|-------------|------------|----------|
+| 5m  | 0.437 | low_vix | 0.565 |
+| 30m | 0.460 | low_vix | 0.615 |
+| 1h  | 0.483 | low_vix | 0.550 |
+| 2h  | 0.499 | high_vix | 0.553 |
+| 4h  | 0.538 | baseline | 0.538 |
+| **1d**  | **0.638** | **baseline** | **0.638** |
+
+**Key insight:** Low-VIX regime gives strong intraday signal (30m AUC 0.615). High-VIX
+crisis periods suppress intraday signal — only 1d and 2h remain tradeable.
+
+---
+
+#### Afternoon: Polymarket L2 Pipeline Built
+
+New scripts and data pipeline for the Polymarket signal arm:
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/pull_polymarket_history.py` | Gamma API discovery + CLOB daily price history per market |
+| `scripts/pull_polymarket_trades.py` | CLOB trade history → hourly USDC volume buckets |
+| `scripts/build_poly_market_data.py` | Session aggregation: group anomaly events → features + SPY labels |
+| `scripts/train_poly_model.py` | XGBoost + isotonic calibration, same interface as Truth Social models |
+
+**Session aggregation design:**
+- Whale anomaly events within a configurable window are grouped into "sessions"
+- Session-level features: `max_price_delta`, `cumulative_delta`, `dominant_direction`, `n_events`, `n_markets`, `corroboration_ratio`, `session_duration_min`
+- Volume features: `max_volume_spike_pct`, `avg_volume_spike_pct`, `n_volume_spikes`
+- Topic composition: `has_tariff`, `has_geopolitical`, `has_fed`, `has_energy`, `has_executive`
+- Regime: `vix_level`, `vix_percentile`, `vixy_level`, `is_market_hours`, `hour_of_day`, `day_of_week`
+
+**Model output:** `P(SPY excess return > 0 after session)` — same interface as Truth Social models.
+Saved as `poly_direction_{period}.pkl` with high/low VIX and decay-weighted variants.
+
+---
+
+### Docs Created / Updated
+
+| File | Content |
+|------|---------|
+| `docs/training_decisions.md` | 12-section design rationale: label method, dead zones, model architecture, regime split, timezone bug, etc. |
+| `docs/model_performance.md` | Full Truth Social L2 results with model routing table for inference time |
+
+---
+
+### Files Built / Updated This Session
+
+```
+scripts/
+├── pull_polymarket_history.py   ← Gamma discovery + CLOB daily prices
+├── pull_polymarket_trades.py    ← CLOB trade history → hourly USDC volume
+├── build_poly_market_data.py    ← session aggregation + SPY label engineering
+└── train_poly_model.py          ← XGBoost L2 trainer (same interface as train_post_model.py)
+docs/
+├── training_decisions.md        ← 12 design decisions with rationale
+└── model_performance.md         ← Truth Social L2 model results + routing table
+models/saved/
+├── spy_direction_{period}.pkl          ← baseline (all 6 periods)
+├── spy_direction_{period}_high_vix.pkl ← VIX ≥ 20 split
+├── spy_direction_{period}_low_vix.pkl  ← VIX < 20 split
+└── spy_direction_{period}_weighted.pkl ← 180-day decay-weighted
+```
+
+---
+
+### Commits This Session
+
+| Hash | Message |
+|------|---------|
+| `082a3b8` | `fix(data)`: label_events + clean_data + train_l2 pipeline fixes |
+| `9aa5a0c` | `feat(data)`: generate real L2 training data from Trump posts via LLM |
+| `9df81ab` | `feat(reasoner)`: L2 model pipeline — Polygon data, alpha labeling, regime split |
+| `d2b4144` | `feat(scanner)`: Polymarket L2 pipeline — session aggregation + SPY model |
+| `9ff71ad` | `feat(scanner)`: add dominant_direction + vixy_level features to Polymarket model |
+| `321d79f` | `feat(scanner)`: add volume/trade-size features to Polymarket session model |
+
+---
+
+### Next Steps (for next session)
+
+- [ ] **Run Polymarket data pipeline** in `whalewatch` conda env:
+  ```
+  python scripts/pull_polymarket_history.py   # discovery + daily prices
+  python scripts/pull_polymarket_trades.py    # hourly USDC volume
+  python scripts/build_poly_market_data.py   # session aggregation
+  python scripts/train_poly_model.py --regime  # train poly_direction_*.pkl
+  ```
+- [ ] Document Polymarket L2 model results in `docs/model_performance.md`
+- [ ] Compare Truth Social vs Polymarket signal quality across holding periods
+- [ ] Wire Polymarket model into `stat_predictor.py` inference path (use `poly_direction_1d.pkl` as secondary scorer)
+- [ ] Run end-to-end `python main.py --once` smoke test with ANTHROPIC_API_KEY in `.env`
+- [ ] Begin paper trading; monitor first live session
+
+---
+
+### Model Routing at Inference Time (Current Best)
+
+```
+VIX >= 20 (elevated/crisis):
+  1d  → spy_direction_1d.pkl              (AUC 0.638)
+  2h  → spy_direction_2h_high_vix.pkl     (AUC 0.553)
+  Others → SKIP
+
+VIX < 20 (calm):
+  30m → spy_direction_30m_low_vix.pkl     (AUC 0.615)  ← best intraday
+  1h  → spy_direction_1h_low_vix.pkl      (AUC 0.550)
+  5m  → spy_direction_5m_low_vix.pkl      (AUC 0.565)
+  1d  → spy_direction_1d.pkl             (AUC 0.638)
+
+Min confidence threshold to act: 0.60
+```
