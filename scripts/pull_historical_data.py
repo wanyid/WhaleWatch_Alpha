@@ -185,17 +185,32 @@ def _extract_yes_token_id(market: dict) -> str | None:
 
 
 def discover_polymarket_markets(session: requests.Session) -> list[dict]:
-    """Fetch all relevant markets (active + closed) from Gamma API."""
+    """Fetch all relevant markets (active + closed) from Gamma API.
+
+    Server-side filters applied to keep discovery tractable:
+      - closed markets: end_date_min=DATA_START (skip pre-2024 markets)
+      - closed markets: volume_num_min=1000 (skip micro-markets with no whale activity)
+
+    Without these filters, Gamma has 150k+ closed markets since 2024 — would
+    take hours to page through.  volume_num_min=1000 cuts this to ~hundreds of
+    pages while keeping all meaningful markets.
+    """
     relevant = []
     limit = 100
 
     for closed in (False, True):
         offset = 0
+        pages = 0
+        base_params: dict = {"closed": str(closed).lower(), "limit": limit}
+        if closed:
+            base_params["end_date_min"] = DATA_START   # skip pre-2024 markets
+            base_params["volume_num_min"] = 1000        # skip micro-markets
+
         while True:
             try:
                 resp = session.get(
                     f"{GAMMA_BASE}/markets",
-                    params={"closed": str(closed).lower(), "limit": limit, "offset": offset},
+                    params={**base_params, "offset": offset},
                     timeout=15,
                 )
                 resp.raise_for_status()
@@ -209,16 +224,23 @@ def discover_polymarket_markets(session: requests.Session) -> list[dict]:
             if not items:
                 break
 
+            pages += 1
             for m in items:
                 if _is_relevant(m.get("question", "")):
                     relevant.append(m)
+
+            if pages % 20 == 0:
+                logger.info("  Gamma page %d (closed=%s, offset=%d) → %d relevant so far",
+                            pages, closed, offset, len(relevant))
 
             if len(items) < limit:
                 break
             offset += limit
             time.sleep(0.2)
 
-    logger.info("Discovered %d relevant Polymarket markets", len(relevant))
+        logger.info("Gamma closed=%s done: %d pages, %d relevant", closed, pages, len(relevant))
+
+    logger.info("Discovered %d relevant Polymarket markets total", len(relevant))
     return relevant
 
 

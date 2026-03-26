@@ -150,9 +150,64 @@ python scripts/pull_historical_data.py
 
 ---
 
+## Session 2 — 2026-03-26
+
+### Participants
+- User (Quantitative Developer)
+- Claude Sonnet 4.6 (AI pair programmer)
+
+---
+
+### Key Decisions / Changes
+
+| Area | Decision | Rationale |
+|------|----------|-----------|
+| Conda env | SSL fixed by copying `libssl-1_1-x64.dll` + `libcrypto-1_1-x64.dll` from `anaconda3/Library/bin/` to `anaconda3/DLLs/`; fresh `whalewatch` env created with Python 3.11 | Base Anaconda env had broken OpenSSL DLL |
+| Equity data | Switched to `1d` (unlimited) + `5m period="60d"` (recent only) | yfinance hard-limits: 5m=60 days, 1h=730 days; 2024-01-01 → today is ~815 days — 1h fails |
+| Polymarket CLOB API | Parameter names changed: `token_id` → `market`, `start_time`/`end_time` → `start_ts`/`end_ts` | Breaking API change on Polymarket's side |
+| Polymarket fidelity | Changed `fidelity=60` → `fidelity=1440` (daily) | Hourly (60) only returns last ~28 days; daily gives full market lifetime history |
+| Polymarket discovery | Added `end_date_min=2024-01-01` + `volume_num_min=1000` for closed markets | Without filters: 150k+ closed markets since 2024 → hours to page through; volume filter cuts to manageable set of whale-relevant markets |
+
+---
+
+### Data Pull Status
+
+| File | Status | Details |
+|------|--------|---------|
+| `equity/SPY_1d.parquet` | ✅ Done | 559 rows, 2024-01-01 → today |
+| `equity/QQQ_1d.parquet` | ✅ Done | 559 rows |
+| `equity/VIX_1d.parquet` | ✅ Done | 559 rows |
+| `equity/SPY_5m_recent.parquet` | ✅ Done | 4,558 rows, last 60 days |
+| `equity/QQQ_5m_recent.parquet` | ✅ Done | 4,556 rows |
+| `equity/VIX_5m_recent.parquet` | ✅ Done | 8,887 rows |
+| `polymarket/markets_catalog.parquet` | ⏳ Re-run needed | Catalog from previous broken run; needs re-pull with fixed params |
+| `polymarket/prices/*.parquet` | ⏳ Pending | Price pull not yet completed; script fixed and ready |
+| `truth_social/trump_posts.jsonl` | ⏳ Pending | Needs TRUTHSOCIAL_USERNAME + TRUTHSOCIAL_PASSWORD in .env |
+
+---
+
+### Commits This Session
+
+| Hash | Message |
+|------|---------|
+| `f61c911` | `feat(init)`: initial project scaffold — architecture, scanners, models |
+| `d403e83` | `feat(reasoner)`: Reasoner Layer 1 + market data provider + historical data pull script |
+| `90400cc` | `feat(data)`: switch equity pull to 1-minute bars via Alpaca + add AlpacaProvider |
+| `57b1c58` | `feat(reasoner)`: Reasoner Layer 2 — logistic regression win-rate + holding-period predictor |
+| `d842635` | `refactor(data)`: replace Alpaca with yfinance 5m chunked — no API key needed |
+| `a07c4cc` | `refactor(data)`: rewrite pull script — dual resolution equity + correct Gamma camelCase fields |
+| `7577ff9` | `fix(data)`: update CLOB API params — token_id→market, fidelity 60→1440 |
+| *(pending)* | `fix(data)`: add Gamma discovery filters (end_date_min + volume_num_min) |
+
+---
+
 ### Next Steps
 
-- [ ] Fix conda SSL issue to run `pip install -r requirements.txt` and execute data pull
+- [ ] **Re-run data pull** — `python scripts/pull_historical_data.py` in `whalewatch` conda env
+  - Active markets discovery: ~90s (367 pages)
+  - Closed markets discovery: ~minutes with new filters
+  - Price fetch: ~10-20 min depending on market count
+  - Truth Social: needs credentials in `.env`
 - [ ] Wire `main.py` orchestration loop (scanners → reasoner → executor)
 - [ ] Build `executor/paper_executor.py` — paper trading + P&L log
 - [ ] Build `risk/risk_manager.py` — enforces guardrails before execution
@@ -165,7 +220,7 @@ python scripts/pull_historical_data.py
 
 ### Known Issues / Open Items
 
-- Conda Python environments on user's machine have a broken OpenSSL DLL — affects all pip installs.
-  **Fix:** Run `conda install -c anaconda openssl && conda update --all` in Anaconda Prompt (as Admin), then create fresh `whalewatch` env.
-- VIX 1-minute data: no free public source exists for an index. Using 5m via yfinance. For live strategy, consider polling CBOE directly or using a VIX ETF proxy (UVXY/VIXY) as a substitute.
-- Truth Social rate limiting: Cloudflare blocks after ~40 rapid requests. Script pauses 25s every 40 posts automatically.
+- **Conda SSL fix**: Copy `libssl-1_1-x64.dll` + `libcrypto-1_1-x64.dll` from `C:\Users\wangy\anaconda3\Library\bin\` to `C:\Users\wangy\anaconda3\DLLs\` if SSL errors recur in the `whalewatch` env.
+- **Polymarket data depth**: CLOB `/prices-history` with `fidelity=1440` returns data only from market creation date (not from 2024-01-01 for newer markets). This is expected — prices don't exist before a market opens.
+- **VIX 5m data**: yfinance returns ~2× more rows than SPY/QQQ for the same period (8,887 vs ~4,557) — likely because VIX trades extended hours. Filter to market hours if needed for signal alignment.
+- **Truth Social rate limiting**: Cloudflare blocks after ~40 rapid requests. Script pauses 25s every 40 posts automatically. Needs credentials in `.env`.
