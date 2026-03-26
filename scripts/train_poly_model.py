@@ -60,47 +60,16 @@ DEAD_ZONE: dict[str, float] = {
 }
 
 # ---------------------------------------------------------------------------
-# Feature definitions
+# Feature definitions — imported from shared module
 # ---------------------------------------------------------------------------
+from reasoner.layer2_predictor.poly_features import (
+    STRENGTH_FEATURES,
+    TOPIC_FEATURES,
+    REGIME_FEATURES,
+    ALL_DIRECTIONAL_FEATURES,
+)
 
-# Session strength — how strong and broad was the Polymarket move
-STRENGTH_FEATURES = [
-    "max_price_delta",       # single largest price move — whale size proxy
-    "cumulative_delta",      # net directional sum (signed)
-    "net_delta_abs",         # absolute cumulative magnitude
-    "dominant_direction",    # +1 YES rising / -1 YES falling (separates direction from magnitude)
-    "n_events",              # total anomaly events in session
-    "n_markets",             # distinct markets involved (cross-market coordination = whale thesis)
-    "n_corroborating",       # events in dominant direction (reinforcement count)
-    "n_opposing",            # counter-events (uncertainty / split-whale signal)
-    "corroboration_ratio",   # n_corroborating / n_events — purity of directional bet
-    "session_duration_min",  # short+large = single whale entry; long = accumulation
-    # Volume features — bet size signal (None/NaN where trade history unavailable)
-    "max_volume_spike_pct",  # largest volume anomaly in session vs rolling avg
-    "avg_volume_spike_pct",  # average volume spike across session events
-    "n_volume_spikes",       # events with BOTH price AND volume anomaly (strongest whale signal)
-]
-
-# Topic composition — which buckets fired
-TOPIC_FEATURES = [
-    "has_tariff",
-    "has_geopolitical",
-    "has_fed",
-    "has_energy",
-    "has_executive",
-]
-
-# Market regime at session time
-REGIME_FEATURES = [
-    "vix_level",        # VIX absolute level — low VIX = cleaner signal environment
-    "vix_percentile",   # VIX relative to history
-    "vixy_level",       # VIXY intraday price — real-time VIX proxy (fear barometer at session time)
-    "is_market_hours",
-    "hour_of_day",
-    "day_of_week",
-]
-
-ALL_FEATURES = STRENGTH_FEATURES + TOPIC_FEATURES + REGIME_FEATURES
+ALL_FEATURES = ALL_DIRECTIONAL_FEATURES
 
 
 # ---------------------------------------------------------------------------

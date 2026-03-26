@@ -48,7 +48,7 @@ from reasoner.layer1_llm.claude_llm import ClaudeLLM
 from reasoner.layer2_predictor.stat_predictor import StatPredictor
 from risk.risk_manager import RiskManager
 from scanners.market_data.yfinance_provider import YFinanceProvider
-from scanners.polymarket_scanner import PolymarketScanner
+from scanners.polymarket_scanner import PolymarketScanner, PolymarketSessionEvent
 from scanners.truthsocial_scanner import TruthSocialScanner
 
 # ---------------------------------------------------------------------------
@@ -237,6 +237,36 @@ def _build_signal_event(
     return ev
 
 
+def _run_poly_session_pipeline(
+    session: "PolymarketSessionEvent",
+    risk: RiskManager,
+    executor: PaperExecutor,
+) -> Optional[str]:
+    """Fast path for Polymarket session events.
+
+    The PolymarketScanner's SessionManager has already run the L2 model and
+    set direction/confidence/holding_period — no LLM call needed here.
+    We use the strongest raw event's market data to populate the SignalEvent.
+    """
+    if not session.raw_events:
+        return None
+
+    # Pick the raw event with the largest price delta as the "anchor"
+    anchor = max(session.raw_events, key=lambda e: abs(e.price_delta))
+    event = _build_signal_event(anchor)
+
+    event.signal_direction = session.signal_direction
+    event.signal_ticker = "SPY"           # Poly models predict SPY direction
+    event.llm_model = "poly_l2_model"
+    event.confidence = session.confidence
+    event.holding_period_minutes = session.holding_period_minutes
+
+    if not risk.approve(event):
+        return None
+
+    return executor.submit_signal(event)
+
+
 def run_pipeline(
     raw: Union[PolymarketRawEvent, TruthSocialRawEvent],
     l1: ClaudeLLM,
@@ -245,7 +275,11 @@ def run_pipeline(
     executor: PaperExecutor,
     dual_companion: Optional[Union[PolymarketRawEvent, TruthSocialRawEvent]] = None,
 ) -> Optional[str]:
-    """Run one raw event through the full pipeline. Returns order_id or None."""
+    """Run one Truth Social raw event through L1 → L2 → risk → execute.
+
+    Polymarket session events are handled by _run_poly_session_pipeline()
+    and do not go through this function.
+    """
     # Build SignalEvent (with dual-signal enrichment if companion present)
     event = _build_signal_event(raw, dual_companion)
 
@@ -412,7 +446,15 @@ def run_live(once: bool = False) -> None:
         try:
             raw = raw_queue.get(timeout=1.0)
 
-            # Deduplication check
+            # Polymarket session events have already been scored by the scanner's
+            # internal L2 model — route them directly to risk + execute.
+            if isinstance(raw, PolymarketSessionEvent):
+                order_id = _run_poly_session_pipeline(raw, risk, executor)
+                if order_id:
+                    logger.info("Poly session position opened: order=%s", order_id[:8])
+                continue
+
+            # Deduplication check (Truth Social raw events only)
             if deduper.is_duplicate(raw):
                 logger.debug("Duplicate signal skipped: %s", type(raw).__name__)
                 continue
@@ -434,10 +476,12 @@ def run_live(once: bool = False) -> None:
         # Periodic sweep
         now = time.time()
         if now - last_sweep >= sweep_interval:
-            # 1. Close expired positions (time-based)
-            closed = executor.close_expired_positions()
-            if closed:
-                logger.info("Swept %d expired position(s)", closed)
+            # 1. Close expired positions (time-based); feed P&L to circuit breaker
+            expired_pnls = executor.close_expired_positions()
+            if expired_pnls:
+                logger.info("Swept %d expired position(s)", len(expired_pnls))
+                for pnl in expired_pnls:
+                    risk.record_pnl(pnl)
 
             # 2. True News Stop — check open Poly positions against latest prices
             _run_true_news_check(executor, market_provider)

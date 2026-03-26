@@ -163,25 +163,30 @@ class PaperExecutor(BaseExecutor):
         )
         return pnl
 
-    def close_expired_positions(self) -> int:
-        """Close any OPEN positions whose holding period has elapsed. Returns count closed."""
+    def close_expired_positions(self) -> list[float]:
+        """Close any OPEN positions whose holding period has elapsed.
+
+        Returns a list of realized P&L values for every position that was
+        closed, so callers can feed them to the RiskManager circuit breaker.
+        """
         now = datetime.now(tz=timezone.utc)
         with self._conn() as conn:
             rows = conn.execute(
                 "SELECT order_id, created_at, holding_period_min FROM positions WHERE outcome='OPEN'"
             ).fetchall()
 
-        closed = 0
+        pnls: list[float] = []
         for order_id, created_at_str, hold_min in rows:
             created_at = datetime.fromisoformat(created_at_str)
             if created_at.tzinfo is None:
                 created_at = created_at.replace(tzinfo=timezone.utc)
             elapsed = (now - created_at).total_seconds() / 60
             if hold_min and elapsed >= hold_min:
-                self.close_position(order_id, reason="TIMEOUT")
-                closed += 1
+                pnl = self.close_position(order_id, reason="TIMEOUT")
+                if pnl is not None:
+                    pnls.append(pnl)
 
-        return closed
+        return pnls
 
     def open_positions(self) -> list[dict]:
         """Return all currently open positions."""
@@ -315,6 +320,7 @@ class PaperExecutor(BaseExecutor):
     def _init_db(self) -> None:
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
         with self._conn() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(_DDL)
         self._migrate_db()
 

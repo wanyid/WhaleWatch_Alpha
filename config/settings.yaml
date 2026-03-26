@@ -3,6 +3,8 @@
 data:
   # Training data window — do not use data before this date
   data_start_date: "2025-01-20"
+  # OOS / live-only split — data after this date is held out from training
+  train_cutoff_date: "2026-02-28"
   # Market data provider: "yfinance" (free) | "polygon" (future)
   market_data_provider: "yfinance"
 
@@ -11,6 +13,8 @@ scanners:
     username: "realDonaldTrump"
     poll_interval_seconds: 60       # Stay under Cloudflare rate limits
     include_reposts: false
+    # Min keyword matches to forward to pipeline (0 = all posts)
+    min_keywords: 1
 
   polymarket:
     poll_interval_seconds: 30
@@ -18,22 +22,29 @@ scanners:
     volume_spike_threshold_pct: 50.0
     # Minimum absolute price delta to trigger signal
     min_price_delta: 0.05
+    # Session aggregation
+    session_timeout_min: 60        # idle minutes before session closes
+    min_events_per_session: 1      # sessions with fewer events are discarded
 
 reasoner:
   layer1:
     # LLM provider: "claude" | "openai"
     provider: "claude"
-    model: "claude-opus-4-6"
+    model: "claude-sonnet-4-6"
     temperature: 0.0                # Deterministic signal generation
 
   layer2:
-    # Predictor: "logistic" | "neural_network"
-    predictor: "logistic"
+    # Predictor: "xgboost" | "logistic" (logistic = legacy fallback)
+    predictor: "xgboost"
     # Min confidence (win rate) to forward to executor
     min_confidence: 0.60
     # Holding period bounds (minutes)
     min_holding_minutes: 1
     max_holding_minutes: 4320       # 3 days
+    # VIX threshold for regime routing (Decision #8)
+    vix_regime_threshold: 20.0
+    # Default model period to use for live inference
+    default_model_period: "1h"
 
 tickers:
   - "SPY"
@@ -44,3 +55,15 @@ risk:
   stop_loss_pct: 0.02               # 2% hard stop
   take_profit_pct: 0.04             # 4% take profit (2:1 R/R)
   daily_drawdown_halt_pct: 0.03     # Halt new signals if daily P&L < -3%
+
+executor:
+  paper_db_path: "D:/WhaleWatch_Data/paper_trades.db"
+
+# Fade model parameters (Option B)
+fade:
+  # Minimum initial 30m move to qualify as a fade candidate
+  poly_overshoot_min_pct: 0.30      # 0.30%
+  post_overshoot_min_pct: 0.30      # 0.30%
+  # Entry lag after directional entry (minutes)
+  poly_entry_lag_min: 30
+  post_entry_lag_min: 30

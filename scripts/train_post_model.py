@@ -68,27 +68,17 @@ MODELS_DIR = Path("models/saved")
 FI_DIR     = Path("D:/WhaleWatch_Data")
 
 # ---------------------------------------------------------------------------
-# Feature set
+# Feature set — imported from shared module so training and inference stay in sync
 # ---------------------------------------------------------------------------
-KEYWORD_FEATURES = [
-    "has_tariff", "has_deal", "has_china", "has_fed",
-    "has_energy", "has_geopolitical", "has_market",
-]
-POST_FEATURES = [
-    "favourites_count", "reblogs_count", "engagement",
-    "caps_ratio", "content_length", "keyword_count",
-]
-TEMPORAL_FEATURES = [
-    "hour_of_day", "day_of_week",
-    "is_market_hours",   # 1 = post during regular trading hours, 0 = pre/after/overnight
-    "is_premarket",
-]
-MARKET_FEATURES = [
-    "vix_level", "vix_percentile",
-    "vixy_level",   # tradeable VIX proxy (available after Polygon pull; 0 if not yet pulled)
-]
+from reasoner.layer2_predictor.post_features import (
+    KEYWORD_FEATURES,
+    POST_FEATURES,
+    TEMPORAL_FEATURES,
+    MARKET_FEATURES,
+    ALL_DIRECTIONAL_FEATURES,
+)
 
-ALL_FEATURES = KEYWORD_FEATURES + POST_FEATURES + TEMPORAL_FEATURES + MARKET_FEATURES
+ALL_FEATURES = ALL_DIRECTIONAL_FEATURES
 
 # Holding periods → raw SPY return column
 HOLDING_PERIODS = {

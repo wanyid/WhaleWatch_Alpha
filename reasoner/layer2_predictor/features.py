@@ -1,5 +1,12 @@
 """Feature engineering for Layer 2 predictor.
 
+DEPRECATED — used only by the legacy StatPredictor (logistic regression).
+New models use the feature sets defined in:
+  - reasoner/layer2_predictor/post_features.py  (Truth Social)
+  - reasoner/layer2_predictor/poly_features.py  (Polymarket)
+Do not add features here.
+
+
 Converts a SignalEvent into a numeric feature vector for model input.
 All features are derived from data available at signal time — no lookahead.
 

@@ -72,59 +72,21 @@ DEFAULT_OVERSHOOT_MIN = 0.0030
 
 
 # ---------------------------------------------------------------------------
-# Feature definitions
+# Feature definitions — imported from shared module
 # ---------------------------------------------------------------------------
-
-# Post content and engagement features
-POST_FEATURES = [
-    "engagement",
-    "favourites_count",
-    "reblogs_count",
-    "caps_ratio",
-    "content_length",
-    "keyword_count",
-]
-
-# Topic keyword flags
-KEYWORD_FEATURES = [
-    "has_tariff",
-    "has_deal",
-    "has_china",
-    "has_fed",
-    "has_energy",
-    "has_geopolitical",
-    "has_market",
-]
-
-# Temporal features
-TEMPORAL_FEATURES = [
-    "hour_of_day",
-    "day_of_week",
-    "is_market_hours",
-    "is_premarket",
-]
-
-# VIX / market regime
-REGIME_FEATURES = [
-    "vix_level",
-    "vix_percentile",
-    "vixy_level",
-]
-
-# Fade-specific features — the initial market reaction to the post
-FADE_FEATURES = [
-    "spy_initial_ret",          # signed 30m return; direction + magnitude of overshoot
-    "spy_initial_direction",    # +1 or -1; explicit directional indicator
-    "spy_abs_initial_ret",      # magnitude alone; larger overshoot → stronger fade candidate
-]
-
-ALL_FEATURES = (
-    POST_FEATURES
-    + KEYWORD_FEATURES
-    + TEMPORAL_FEATURES
-    + REGIME_FEATURES
-    + FADE_FEATURES
+from reasoner.layer2_predictor.post_features import (
+    KEYWORD_FEATURES,
+    POST_FEATURES,
+    TEMPORAL_FEATURES,
+    MARKET_FEATURES,
+    FADE_FEATURES,
+    ALL_FADE_FEATURES,
 )
+
+# Local alias — MARKET_FEATURES was called REGIME_FEATURES in the old inline version
+REGIME_FEATURES = MARKET_FEATURES
+
+ALL_FEATURES = ALL_FADE_FEATURES
 
 
 # ---------------------------------------------------------------------------

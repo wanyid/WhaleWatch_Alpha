@@ -223,8 +223,8 @@ class TestPaperExecutorIntegration:
             conn.execute("UPDATE positions SET created_at=? WHERE order_id=?",
                          (past, order_id))
 
-        closed_count = executor.close_expired_positions()
-        assert closed_count == 1
+        closed_pnls = executor.close_expired_positions()
+        assert len(closed_pnls) == 1   # returns list of P&L values now
         assert len(executor.open_positions()) == 0
 
     def test_session_summary(self, tmp_path):

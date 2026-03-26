@@ -72,51 +72,20 @@ DEFAULT_OVERSHOOT_MIN = 0.0030
 
 
 # ---------------------------------------------------------------------------
-# Feature definitions
+# Feature definitions — imported from shared module
 # ---------------------------------------------------------------------------
+from reasoner.layer2_predictor.poly_features import (
+    STRENGTH_FEATURES,
+    TOPIC_FEATURES,
+    REGIME_FEATURES,
+    FADE_FEATURES,
+    ALL_FADE_FEATURES,
+)
 
-# Session strength features (same as directional model)
-SESSION_FEATURES = [
-    "max_price_delta",
-    "cumulative_delta",
-    "net_delta_abs",
-    "dominant_direction",
-    "n_events",
-    "n_markets",
-    "n_corroborating",
-    "n_opposing",
-    "corroboration_ratio",
-    "session_duration_min",
-    "max_volume_spike_pct",
-    "avg_volume_spike_pct",
-    "n_volume_spikes",
-]
+# Local alias — STRENGTH_FEATURES was called SESSION_FEATURES in the old inline version
+SESSION_FEATURES = STRENGTH_FEATURES
 
-TOPIC_FEATURES = [
-    "has_tariff",
-    "has_geopolitical",
-    "has_fed",
-    "has_energy",
-    "has_executive",
-]
-
-REGIME_FEATURES = [
-    "vix_level",
-    "vix_percentile",
-    "vixy_level",
-    "is_market_hours",
-    "hour_of_day",
-    "day_of_week",
-]
-
-# Fade-specific features — the initial market reaction
-FADE_FEATURES = [
-    "initial_ret",          # signed 30m return; direction + magnitude of overshoot
-    "initial_direction",    # +1 or -1; redundant with sign(initial_ret) but explicit
-    "abs_initial_ret",      # magnitude alone; larger overshoot → stronger fade candidate
-]
-
-ALL_FEATURES = SESSION_FEATURES + TOPIC_FEATURES + REGIME_FEATURES + FADE_FEATURES
+ALL_FEATURES = ALL_FADE_FEATURES
 
 
 # ---------------------------------------------------------------------------

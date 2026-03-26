@@ -27,6 +27,7 @@ import pandas as pd
 import requests
 
 from models.raw_events import PolymarketRawEvent
+from reasoner.layer2_predictor.poly_features import ALL_DIRECTIONAL_FEATURES as _POLY_FEATURES
 from scanners.base_scanner import BaseScanner
 
 logger = logging.getLogger(__name__)
@@ -313,7 +314,7 @@ class SessionManager:
         avg_vol_spike = sum(vol_spikes) / len(vol_spikes) if vol_spikes else 0.0
         n_vol_spikes  = sum(1 for e in events if e.volume_spike_pct >= 50.0)
 
-        return {
+        feature_dict = {
             "max_price_delta":      max(abs(e.price_delta) for e in events),
             "cumulative_delta":     cum_delta,
             "net_delta_abs":        abs(cum_delta),
@@ -339,6 +340,13 @@ class SessionManager:
             "hour_of_day":          local_ts.hour,
             "day_of_week":          local_ts.weekday(),
         }
+
+        # Validate that all expected features are present (catches drift early)
+        missing = [f for f in _POLY_FEATURES if f not in feature_dict]
+        if missing:
+            logger.warning("_build_features: missing %d feature(s): %s", len(missing), missing)
+
+        return feature_dict
 
     def _score(self, feature_dict: dict) -> tuple[str, float, int]:
         """Run L2 model → (direction, confidence, holding_period_minutes)."""
