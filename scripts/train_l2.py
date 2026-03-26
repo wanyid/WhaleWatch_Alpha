@@ -190,8 +190,15 @@ def run(n_folds: int = 5, report_only: bool = False) -> None:
         return
 
     # Fit final models on all data
+    # stat_predictor.train() expects 'won' and 'holding_minutes' columns
+    df_train = df.copy()
+    if "won" not in df_train.columns:
+        df_train["won"] = df_train["outcome"].map({"WIN": 1, "LOSS": 0, "STOP_OUT": 0}).fillna(0).astype(int)
+    if "holding_minutes" not in df_train.columns:
+        df_train["holding_minutes"] = df_train.get("holding_period_min", 60).clip(1, 4320)
+
     predictor = StatPredictor()
-    predictor.train(df)
+    predictor.train(df_train)
 
     if not predictor.is_trained():
         logger.error("Training failed — check data quality")

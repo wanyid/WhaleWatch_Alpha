@@ -98,7 +98,8 @@ def _price_at(ticker: str, ts: datetime) -> Optional[float]:
         if not mask.any():
             continue
         row = df.loc[mask].iloc[-1]
-        close_col = "Close" if "Close" in row.index else row.index[3]  # OHLCV column 3
+        # Equity parquets normalised to lowercase columns: open,high,low,close,volume
+        close_col = next((c for c in ("close", "Close") if c in row.index), row.index[3])
         return float(row[close_col])
     return None
 
@@ -110,27 +111,54 @@ def _price_at(ticker: str, ts: datetime) -> Optional[float]:
 def _detect_whale_moves(
     prices_df: pd.DataFrame,
     min_delta: float = 0.05,
-    window_minutes: int = 60,
+    window_days: int = 3,
 ) -> list[dict]:
-    """Return list of {ts, price_before, price_after, price_delta} dicts."""
+    """Detect significant probability moves in stored parquet price history.
+
+    Stored format: DatetimeIndex (timestamp), column 'yes_price'.
+    Fidelity is daily (1440-min bars) so we use a day-based window.
+
+    Returns list of {ts, price_before, price_after, price_delta} dicts.
+    """
     if prices_df.empty:
         return []
 
-    moves = []
-    prices_df = prices_df.sort_values("t")
-    ts_arr = prices_df["t"].values
-    p_arr = prices_df["p"].values
+    # Normalise: expect DatetimeIndex + 'yes_price' column (stored format)
+    if "yes_price" in prices_df.columns:
+        df = prices_df[["yes_price"]].copy().sort_index()
+        df.columns = ["p"]
+    elif "p" in prices_df.columns:
+        # Raw API format (t, p) — reset to numeric index, use t as timestamp
+        df = prices_df.copy()
+        if "t" in df.columns:
+            df["ts_col"] = pd.to_datetime(df["t"], unit="s", utc=True)
+            df = df.set_index("ts_col")[["p"]].sort_index()
+        else:
+            return []
+    else:
+        return []
 
-    for i in range(1, len(ts_arr)):
-        dt = (ts_arr[i] - ts_arr[i - 1])  # seconds
-        if dt > window_minutes * 60:
-            continue
-        delta = p_arr[i] - p_arr[i - 1]
+    if not isinstance(df.index, pd.DatetimeIndex):
+        try:
+            df.index = pd.to_datetime(df.index, utc=True)
+        except Exception:
+            return []
+
+    window_td = timedelta(days=window_days)
+    moves = []
+    idx = df.index
+    p_vals = df["p"].values
+
+    for i in range(1, len(idx)):
+        dt_gap = idx[i] - idx[i - 1]
+        if dt_gap > window_td:
+            continue  # gap too large — treat as unrelated bars
+        delta = float(p_vals[i]) - float(p_vals[i - 1])
         if abs(delta) >= min_delta:
             moves.append({
-                "ts": datetime.fromtimestamp(int(ts_arr[i]), tz=timezone.utc),
-                "price_before": float(p_arr[i - 1]),
-                "price_after": float(p_arr[i]),
+                "ts": idx[i].to_pydatetime(),
+                "price_before": float(p_vals[i - 1]),
+                "price_after": float(p_vals[i]),
                 "price_delta": float(delta),
             })
     return moves
@@ -177,6 +205,11 @@ def _label_move(
     exit_price = _price_at(ticker, exit_ts)
 
     if entry_price is None or exit_price is None:
+        return None
+
+    # With daily bars, entry == exit for any intraday hold (different bar not yet reached).
+    # Skip these to avoid training the model on 0-return noise.
+    if entry_price == exit_price and hold_minutes < 1440:
         return None
 
     # Compute P&L
@@ -277,10 +310,24 @@ def run(
     catalog = pd.read_parquet(CATALOG_PATH)
     logger.info("Catalog: %d markets total", len(catalog))
 
-    # Filter to markets with enough volume
-    if "volume_24h" in catalog.columns:
-        catalog = catalog[catalog["volume_24h"] >= min_volume]
-    logger.info("After volume filter (>= %s): %d markets", min_volume, len(catalog))
+    # Filter: must have a price file on disk.
+    # Closed markets have volume_24h=0 (no longer trading) but were already
+    # quality-filtered at discovery time (volume_num_min=50000 in pull_historical_data.py).
+    # volume_24h filter would incorrectly exclude all historical closed markets.
+    catalog = catalog[
+        catalog["condition_id"].apply(
+            lambda cid: bool(cid) and (POLY_PRICES_DIR / f"{cid}_YES.parquet").exists()
+        )
+    ].copy()
+    logger.info("After price-file filter: %d markets", len(catalog))
+
+    # For open markets only, optionally apply the volume_24h floor
+    if min_volume > 0:
+        is_closed = catalog.get("closed", pd.Series(False, index=catalog.index))
+        open_mask = ~is_closed
+        volume_ok = catalog.get("volume_24h", pd.Series(0.0, index=catalog.index)) >= min_volume
+        catalog = catalog[is_closed | (open_mask & volume_ok)].copy()
+        logger.info("After open-market volume filter (>= %s): %d markets", min_volume, len(catalog))
 
     if max_markets:
         catalog = catalog.head(max_markets)

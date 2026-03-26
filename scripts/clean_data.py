@@ -54,16 +54,23 @@ OUT_PATH = DATA_ROOT / "clean_training_data.parquet"
 SETTINGS_PATH = Path("config/settings.yaml")
 TRAINING_START = "2025-01-20"
 
-# Feature groups (must match features.py)
+# Feature groups (must match features.py FEATURE_NAMES exactly)
 POLY_CONTINUOUS = ["poly_price_delta", "poly_price_delta_abs", "poly_volume_spike_pct"]
 TEMPORAL = ["hour_of_day", "day_of_week"]
+VIX_FEATURES = ["vix_level", "vix_percentile"]
 BINARY_FEATURES = [
     "poly_yes_direction", "has_poly_signal", "has_ts_signal",
     "dual_signal", "is_us_market_hours", "is_premarket",
     "direction_buy", "direction_short",
     "ticker_spy", "ticker_qqq", "ticker_vix",
 ]
-ALL_FEATURES = POLY_CONTINUOUS + ["ts_keyword_count", "ts_engagement"] + TEMPORAL + BINARY_FEATURES
+ALL_FEATURES = (
+    POLY_CONTINUOUS
+    + ["ts_keyword_count", "ts_engagement"]
+    + TEMPORAL
+    + VIX_FEATURES
+    + BINARY_FEATURES
+)
 
 VALID_OUTCOMES = {"WIN", "LOSS", "STOP_OUT"}
 VALID_TICKERS = {"SPY", "QQQ", "VIX"}
@@ -227,6 +234,57 @@ def _reconstruct_features(df: pd.DataFrame) -> pd.DataFrame:
         df["has_ts_signal"] = 0
     if "dual_signal" not in df.columns:
         df["dual_signal"] = 0
+
+    # VIX regime features — looked up from stored VIX parquet per signal timestamp
+    df = _add_vix_features(df)
+
+    return df
+
+
+def _add_vix_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add vix_level and vix_percentile columns by looking up VIX_1d.parquet."""
+    vix_path = DATA_ROOT / "equity" / "VIX_1d.parquet"
+    if not vix_path.exists():
+        logger.warning("VIX_1d.parquet not found — vix_level/vix_percentile will be 0")
+        df["vix_level"] = 0.0
+        df["vix_percentile"] = 0.0
+        return df
+
+    try:
+        vix = pd.read_parquet(vix_path)
+        if not isinstance(vix.index, pd.DatetimeIndex):
+            vix.index = pd.to_datetime(vix.index, utc=True)
+        elif vix.index.tz is None:
+            vix.index = vix.index.tz_localize("UTC")
+
+        close_col = "close" if "close" in vix.columns else \
+                    "Close" if "Close" in vix.columns else vix.columns[3]
+        vix_series = vix[close_col].sort_index().dropna()
+        vix_pct = vix_series.rank(pct=True).rolling(252, min_periods=10).mean()
+
+        def _lookup(ts):
+            mask = vix_series.index <= ts
+            if not mask.any():
+                return 0.0, 0.0
+            level = float(vix_series[mask].iloc[-1])
+            pct = float(vix_pct[mask].iloc[-1]) if vix_pct is not None else 0.0
+            return level, (pct if not np.isnan(pct) else 0.0)
+
+        levels = []
+        pcts = []
+        for ts in df["created_at"]:
+            lvl, pct = _lookup(ts)
+            levels.append(lvl)
+            pcts.append(pct)
+
+        df["vix_level"] = levels
+        df["vix_percentile"] = pcts
+        logger.info("VIX features added: non-zero in %d/%d rows",
+                    (np.array(levels) > 0).sum(), len(levels))
+    except Exception as exc:
+        logger.warning("VIX feature computation failed: %s — filling 0", exc)
+        df["vix_level"] = 0.0
+        df["vix_percentile"] = 0.0
 
     return df
 
