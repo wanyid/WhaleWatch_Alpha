@@ -48,6 +48,17 @@ MODELS_DIR  = PROJECT_ROOT / "models" / "saved"
 
 HOLDING_PERIODS = ["5m", "30m", "1h", "2h", "4h", "1d"]
 
+# Dead-zone thresholds (moved here from builder so they can be varied without
+# rebuilding the dataset — same values as before).
+DEAD_ZONE: dict[str, float] = {
+    "5m":  0.0010,   # 0.10%
+    "30m": 0.0020,   # 0.20%
+    "1h":  0.0030,   # 0.30%
+    "2h":  0.0040,   # 0.40%
+    "4h":  0.0060,   # 0.60%
+    "1d":  0.0080,   # 0.80%
+}
+
 # ---------------------------------------------------------------------------
 # Feature definitions
 # ---------------------------------------------------------------------------
@@ -151,14 +162,25 @@ def _build_calibrated_model(
     y: pd.Series,
     sample_weight: np.ndarray | None = None,
 ):
-    """Fit XGBoost + isotonic calibration on the full dataset.
+    """Fit XGBoost + calibration on the full training dataset.
+
+    Calibration method:
+      isotonic  — flexible, but requires ~150+ samples to avoid overfitting
+      sigmoid   — stable at small N; used when n < 150
 
     Uses TimeSeriesSplit for calibration folds so future data never contaminates
     earlier calibration folds.
+
+    scale_pos_weight accounts for class imbalance (especially relevant for
+    regime sub-models which train on a fraction of the full dataset).
     """
     from sklearn.calibration import CalibratedClassifierCV
     from sklearn.model_selection import TimeSeriesSplit
     from xgboost import XGBClassifier
+
+    n_pos = int(y.sum())
+    n_neg = len(y) - n_pos
+    spw   = min(n_neg / max(n_pos, 1), 5.0)   # cap at 5× to avoid extreme weighting
 
     base = XGBClassifier(
         n_estimators=200,
@@ -166,11 +188,15 @@ def _build_calibrated_model(
         learning_rate=0.05,
         subsample=0.8,
         colsample_bytree=0.8,
+        scale_pos_weight=spw,
         eval_metric="logloss",
         random_state=42,
         verbosity=0,
     )
-    clf = CalibratedClassifierCV(base, method="isotonic", cv=TimeSeriesSplit(n_splits=3))
+    # Isotonic calibration requires sufficient samples to avoid overfitting;
+    # sigmoid is more stable below the 150-sample threshold.
+    method = "isotonic" if len(y) >= 150 else "sigmoid"
+    clf    = CalibratedClassifierCV(base, method=method, cv=TimeSeriesSplit(n_splits=3))
     fit_kwargs = {} if sample_weight is None else {"sample_weight": sample_weight}
     clf.fit(X, y, **fit_kwargs)
     return clf
@@ -247,14 +273,37 @@ def train_period(
     decay_half: int,
 ) -> None:
     lbl_col = f"label_{period}"
+    exc_col = f"excess_ret_{period}"
     ret_col = f"ret_{period}"
 
     if lbl_col not in df_train.columns:
         logger.warning("  %s: label column missing — skipping", period)
         return
 
-    df_valid = df_train[df_train[lbl_col].notna()].copy()
+    # Apply dead-zone filter: drop rows where |excess_ret| is below threshold.
+    # This was previously done at build time; moving it here lets us vary the
+    # threshold without rebuilding the dataset and keeps raw labels available
+    # for the fade model pipeline.
+    dead_zone = DEAD_ZONE.get(period, 0.0)
+    if exc_col in df_train.columns:
+        mask_valid = (
+            df_train[lbl_col].notna() &
+            (df_train[exc_col].abs() >= dead_zone)
+        )
+    else:
+        mask_valid = df_train[lbl_col].notna()
+        logger.warning("  %s: excess_ret column missing — dead zone not applied", period)
+
+    df_valid = df_train[mask_valid].copy()
     df_valid[lbl_col] = df_valid[lbl_col].astype(int)
+
+    n_total_nonnull = int(df_train[lbl_col].notna().sum())
+    n_dropped       = n_total_nonnull - len(df_valid)
+    logger.info(
+        "  %s: raw=%d  after_dead_zone=%d (dropped %d=%.0f%%)",
+        period, n_total_nonnull, len(df_valid),
+        n_dropped, n_dropped / max(n_total_nonnull, 1) * 100,
+    )
 
     features = [f for f in ALL_FEATURES if f in df_valid.columns]
     X = df_valid[features]
@@ -271,14 +320,24 @@ def train_period(
     from sklearn.calibration import CalibratedClassifierCV
     from sklearn.model_selection import TimeSeriesSplit
 
+    # model_factory is used inside _cross_validate where each fold trains on a
+    # subset. Use sigmoid calibration (stable at small N) since fold sizes are
+    # always smaller than the full training set. scale_pos_weight is set from
+    # the full-fold class ratio as a reasonable approximation.
+    n_pos_full = int(y.sum())
+    n_neg_full = len(y) - n_pos_full
+    spw_approx = min(n_neg_full / max(n_pos_full, 1), 5.0)
+
     def model_factory():
         base = XGBClassifier(
             n_estimators=200, max_depth=4, learning_rate=0.05,
             subsample=0.8, colsample_bytree=0.8,
+            scale_pos_weight=spw_approx,
             eval_metric="logloss", random_state=42, verbosity=0,
         )
-        # TimeSeriesSplit for calibration — respects temporal order within each CV fold
-        return CalibratedClassifierCV(base, method="isotonic", cv=TimeSeriesSplit(n_splits=3))
+        # Use sigmoid in CV context: fold sizes are ~1/5 of training set,
+        # making isotonic calibration unreliable within each fold.
+        return CalibratedClassifierCV(base, method="sigmoid", cv=TimeSeriesSplit(n_splits=3))
 
     # Build OOS arrays (shared across all variants for this period)
     X_oos_p: pd.DataFrame = pd.DataFrame()

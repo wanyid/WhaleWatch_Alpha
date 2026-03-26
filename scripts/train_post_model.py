@@ -208,18 +208,29 @@ def _build_label(
 # Model building
 # ---------------------------------------------------------------------------
 
-def _build_pipeline(model_type: str = "xgboost"):
+def _build_pipeline(model_type: str = "xgboost", y: np.ndarray | None = None):
+    """Build classifier pipeline.
+
+    y is passed optionally to compute scale_pos_weight for XGBoost.
+    When y is None (e.g., inside CV model_factory), class weighting is skipped.
+    """
     from sklearn.pipeline import Pipeline
 
     if model_type == "xgboost":
         try:
             from xgboost import XGBClassifier
+            spw = 1.0
+            if y is not None:
+                n_pos = int(y.sum())
+                n_neg = len(y) - n_pos
+                spw   = min(n_neg / max(n_pos, 1), 5.0)
             clf = XGBClassifier(
                 n_estimators=200,
                 max_depth=4,
                 learning_rate=0.05,
                 subsample=0.8,
                 colsample_bytree=0.8,
+                scale_pos_weight=spw,
                 eval_metric="logloss",
                 random_state=42,
                 verbosity=0,
@@ -239,8 +250,10 @@ def _build_pipeline(model_type: str = "xgboost"):
 
 
 def _build_calibrated_model(X, y, model_type: str = "xgboost", sample_weight=None):
-    pipe   = _build_pipeline(model_type)
-    method = "isotonic" if len(y) >= 50 else "sigmoid"
+    pipe = _build_pipeline(model_type, y=y)
+    # Isotonic calibration requires sufficient samples to avoid overfitting.
+    # Sigmoid is more stable below the 150-sample threshold.
+    method = "isotonic" if len(y) >= 150 else "sigmoid"
     # Use TimeSeriesSplit so calibration folds respect time order — avoids
     # future data leaking into earlier calibration folds.
     cal    = CalibratedClassifierCV(pipe, method=method, cv=TimeSeriesSplit(n_splits=3))

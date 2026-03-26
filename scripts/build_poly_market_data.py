@@ -397,23 +397,36 @@ def add_excess_labels(sessions: pd.DataFrame) -> pd.DataFrame:
     """Convert raw SPY returns to excess returns; add binary direction labels.
 
     Excess return = actual return − rolling 20-session mean (removes SPY drift).
-    Dead zone: rows with |excess_ret| < threshold are dropped (too small to
-    attribute to the Polymarket signal).
+    shift(1) ensures each session's baseline uses only prior sessions — no
+    lookahead.
+
+    NOTE: dead-zone filtering is intentionally NOT applied here. The dead zone
+    is applied at training time (train_poly_model.py) so that:
+      - Different thresholds can be tested without rebuilding the dataset
+      - The fade model can use a different (stricter) overshoot threshold
+      - The raw excess_ret_* columns remain available for continuation-return
+        computation in the fade pipeline
     """
     for period_name in HOLDING_PERIODS:
         ret_col   = f"ret_{period_name}"
         ex_col    = f"excess_ret_{period_name}"
         lbl_col   = f"label_{period_name}"
-        dead_zone = DEAD_ZONE_PCT[period_name]
 
         if ret_col not in sessions.columns:
             continue
 
-        baseline         = sessions[ret_col].rolling(ROLLING_BASELINE_WINDOW, min_periods=5).mean()
+        # shift(1): row i's baseline uses sessions 0..i-1 only
+        baseline         = sessions[ret_col].shift(1).rolling(
+            ROLLING_BASELINE_WINDOW, min_periods=5
+        ).mean()
         sessions[ex_col] = sessions[ret_col] - baseline
 
-        valid             = sessions[ex_col].abs() >= dead_zone
-        sessions[lbl_col] = np.where(valid, (sessions[ex_col] > 0).astype(int), np.nan)
+        # Label = sign of excess return; NaN only where excess_ret is NaN
+        sessions[lbl_col] = np.where(
+            sessions[ex_col].notna(),
+            (sessions[ex_col] > 0).astype(int),
+            np.nan,
+        )
 
     return sessions
 
