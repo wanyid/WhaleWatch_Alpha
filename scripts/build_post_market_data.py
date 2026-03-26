@@ -67,6 +67,10 @@ MARKET_CLOSE_UTC = 20 * 60        # 1200 minutes
 # Intraday holding periods in minutes
 INTRADAY_PERIODS = [5, 30, 60, 120, 240]   # 5m 30m 1h 2h 4h
 
+# Fade model constants
+FADE_ENTRY_LAG = "30m"                    # initial move window before fade entry
+FADE_PERIODS   = ["2h", "4h", "1d"]       # holding periods for fade model
+
 # Keyword category flags
 KEYWORD_CATEGORIES = {
     "has_tariff":       ["tariff", "tariffs", "trade war", "trade deal", "import", "export", "trade deficit"],
@@ -394,6 +398,72 @@ def _compute_returns(
 
 
 # ---------------------------------------------------------------------------
+# Fade label computation
+# ---------------------------------------------------------------------------
+
+def add_fade_labels(df: pd.DataFrame) -> pd.DataFrame:
+    """Add fade (mean-reversion) labels and continuation returns to the dataset.
+
+    Fade thesis: after a Trump post the market makes an initial 30m move. When
+    that move is large enough (filtered at training time), fading the direction
+    may be profitable as the overshoot reverts.
+
+    Columns added:
+      spy_initial_ret        — same as spy_ret_30m; signed initial move
+      spy_initial_direction  — +1 or -1
+      spy_abs_initial_ret    — |spy_ret_30m|
+      spy_ret_cont_{p}       — continuation return (spy_ret_{p} - spy_ret_30m)
+                               for p in ["2h", "4h", "1d"]
+      spy_fade_label_{p}     — 1 if continuation moved OPPOSITE to initial move
+                               (fade worked), 0 if continuation continued in
+                               the same direction; NaN if either return missing.
+    """
+    if "spy_ret_30m" not in df.columns:
+        logger.warning("spy_ret_30m not found — skipping fade label computation")
+        return df
+
+    df = df.copy()
+
+    df["spy_initial_ret"]       = df["spy_ret_30m"]
+    df["spy_initial_direction"] = np.sign(df["spy_ret_30m"])
+    df["spy_abs_initial_ret"]   = df["spy_ret_30m"].abs()
+
+    period_col_map = {"2h": "spy_ret_2h", "4h": "spy_ret_4h", "1d": "spy_ret_1d"}
+
+    for period in FADE_PERIODS:
+        total_col = period_col_map.get(period)
+        cont_col  = f"spy_ret_cont_{period}"
+        lbl_col   = f"spy_fade_label_{period}"
+
+        if total_col not in df.columns:
+            logger.warning("  %s not found — skipping fade labels for %s", total_col, period)
+            continue
+
+        # Continuation return = full-period return minus initial 30m move
+        df[cont_col] = df[total_col] - df["spy_ret_30m"]
+
+        # Fade worked = continuation moved opposite to initial direction
+        both_valid  = df["spy_ret_30m"].notna() & df[total_col].notna()
+        fade_worked = (df[cont_col] * df["spy_ret_30m"]) < 0
+        df[lbl_col] = np.where(both_valid, fade_worked.astype(int), np.nan)
+
+    # Summary
+    for period in FADE_PERIODS:
+        lbl_col = f"spy_fade_label_{period}"
+        if lbl_col in df.columns:
+            s = df[lbl_col].dropna()
+            if len(s) > 0:
+                logger.info(
+                    "  fade_label_%s: n=%d  fade_worked=%.1f%%  "
+                    "initial_ret mean=|%.4f|",
+                    period, len(s), float(s.mean()) * 100,
+                    float(df["spy_abs_initial_ret"].dropna().mean()),
+                )
+
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -460,6 +530,10 @@ def run(
     df = pd.DataFrame(rows)
     df["posted_at"] = pd.to_datetime(df["posted_at"], utc=True)
 
+    # ---- Fade labels ----
+    logger.info("Computing fade labels ...")
+    df = add_fade_labels(df)
+
     # ---- Summary report ----
     ret_cols_1d    = [c for c in df.columns if c.endswith("_ret_1d")]
     ret_cols_intra = [c for c in df.columns if "_ret_" in c and not c.endswith("_ret_1d")]
@@ -501,6 +575,15 @@ def run(
         if flag in df.columns:
             n = df[flag].sum()
             print(f"    {flag:22s}: {n:4d} posts ({n/len(df):.0%})")
+
+    fade_label_cols = [c for c in df.columns if c.startswith("spy_fade_label_")]
+    if fade_label_cols:
+        print()
+        print("  Fade label coverage (fade_worked rate):")
+        for col in sorted(fade_label_cols):
+            s = df[col].dropna()
+            print(f"    {col:26s}: n={len(s):4d}  fade_worked={s.mean():.0%}")
+
     print("=" * 65 + "\n")
 
     # Save
