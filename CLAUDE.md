@@ -174,7 +174,7 @@ class SignalEvent:
 
 | Component | Interface | Current Implementation | Swap Path |
 |-----------|-----------|----------------------|-----------|
-| Market data | `base_provider.py` | `yfinance_provider.py` | Add `polygon_provider.py`, update `settings.yaml → data.provider` |
+| Market data | `base_provider.py` | `yfinance_provider.py` (5m chunked) | Add `polygon_provider.py`, update `settings.yaml → data.provider` |
 | LLM | `base_llm.py` | `claude_llm.py` | Add `openai_llm.py`, update `settings.yaml → llm.provider` |
 | Predictor | `base_predictor.py` | `stat_predictor.py` | Switch to `nn_predictor.py` after ≥ 200 labeled events |
 | Executor | `base_executor.py` | `paper_executor.py` | Switch to `alpaca_executor.py` for live trading |

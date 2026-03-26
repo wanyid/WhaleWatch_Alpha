@@ -1,18 +1,18 @@
-"""One-time historical data pull.
+"""One-time historical data pull — no API key required.
 
 Downloads and stores:
-  1. SPY / QQQ  — 1-minute OHLCV since 2024-01-01 via Alpaca (free IEX feed)
-     VIX        — 1-hour OHLCV since 2024-01-01 via yfinance
-                  (VIX is an index; free 1-minute data is not publicly available)
-  2. Polymarket — price history for all politically-relevant markets
-                  (including closed ones) via CLOB + Gamma APIs
-  3. Truth Social — all @realDonaldTrump posts since 2024-01-01 via truthbrush
+  1. SPY / QQQ / VIX  — 5-minute OHLCV since 2024-01-01 via yfinance
+                         (chunked in 50-day windows; free, no signup needed)
+  2. Polymarket        — hourly price history for all politically-relevant
+                         markets (including closed) via CLOB + Gamma APIs
+  3. Truth Social      — all @realDonaldTrump posts since 2024-01-01
+                         via truthbrush (requires Truth Social credentials)
 
 Output directory: D:/WhaleWatch_Data/
   equity/
-    SPY_1m.parquet         (~600k rows for 2024–present)
-    QQQ_1m.parquet
-    VIX_1h.parquet         (1-hour resolution — finest freely available for VIX)
+    SPY_5m.parquet         (~1.5M rows, ~80 MB)
+    QQQ_5m.parquet
+    VIX_5m.parquet
   polymarket/
     markets_catalog.parquet
     prices/{condition_id}_YES.parquet
@@ -20,15 +20,16 @@ Output directory: D:/WhaleWatch_Data/
     trump_posts.jsonl
 
 Prerequisites:
-  - ALPACA_API_KEY + ALPACA_SECRET_KEY in .env (free signup at alpaca.markets)
-  - TRUTHSOCIAL_USERNAME + TRUTHSOCIAL_PASSWORD in .env (for Truth Social pull)
+  - Python env with requirements.txt installed
+  - TRUTHSOCIAL_USERNAME + TRUTHSOCIAL_PASSWORD in .env  (Truth Social only)
+  - No other API keys needed
 
 Run once:
     python scripts/pull_historical_data.py
 
 Re-running is safe:
-  - Equity files are overwritten (re-download full history)
-  - Polymarket price files skip markets already downloaded
+  - Equity files are overwritten (full re-download)
+  - Polymarket price files skip markets already on disk
   - Truth Social appends only posts newer than the last stored post_id
 """
 
@@ -71,8 +72,10 @@ POLY_DIR = DATA_ROOT / "polymarket"
 POLY_PRICES_DIR = POLY_DIR / "prices"
 TS_DIR = DATA_ROOT / "truth_social"
 
+TICKERS = ["SPY", "QQQ", "VIX"]
+
 GAMMA_BASE = "https://gamma-api.polymarket.com"
-CLOB_BASE = "https://clob.polymarket.com"
+CLOB_BASE  = "https://clob.polymarket.com"
 
 WATCHLIST_KEYWORDS = [
     "tariff", "tariffs", "trade war", "trade deal",
@@ -87,87 +90,37 @@ TRUTH_SOCIAL_USER = "realDonaldTrump"
 
 
 # ===========================================================================
-# 1. Equity data
-#    SPY + QQQ  → Alpaca 1-minute bars
-#    VIX        → yfinance 1-hour bars (finest available for free on an index)
+# 1. Equity data — yfinance 5-minute, chunked
 # ===========================================================================
 
-def pull_equity_alpaca(ticker: str, today: str) -> None:
-    """Pull 1-minute bars from Alpaca and save as parquet."""
-    from scanners.market_data.alpaca_provider import AlpacaProvider
-
-    provider = AlpacaProvider()
-    out_path = EQUITY_DIR / f"{ticker}_1m.parquet"
-
-    logger.info("Downloading %s 1-minute bars %s → %s via Alpaca...", ticker, DATA_START, today)
-    df = provider.get_ohlcv(ticker, start=DATA_START, end=today, interval="1m")
-
-    if df.empty:
-        logger.warning("No 1-minute data returned for %s.", ticker)
-        return
-
-    df.to_parquet(out_path)
-    logger.info(
-        "Saved %s rows → %s  (%.1f MB)",
-        f"{len(df):,}", out_path, out_path.stat().st_size / 1e6,
-    )
-
-
-def pull_vix_yfinance(today: str) -> None:
-    """Pull 1-hour VIX bars from yfinance and save as parquet.
-
-    Note: yfinance caps 1-minute data at 7 days and 1-hour at 730 days.
-    VIX is a CBOE index — free 1-minute data is not publicly available.
-    1-hour resolution is used for backtesting; the live strategy can
-    fetch real-time VIX snapshots separately.
-    """
-    import yfinance as yf
-
-    out_path = EQUITY_DIR / "VIX_1h.parquet"
-    logger.info("Downloading VIX 1-hour bars %s → %s via yfinance...", DATA_START, today)
-
-    df = yf.download(
-        "^VIX",
-        start=DATA_START,
-        end=today,
-        interval="1h",
-        auto_adjust=True,
-        progress=False,
-    )
-
-    if df.empty:
-        logger.warning("No VIX data returned.")
-        return
-
-    df.columns = [c.lower() if isinstance(c, str) else c[0].lower() for c in df.columns]
-    df.index = pd.to_datetime(df.index, utc=True)
-    df = df[["open", "high", "low", "close", "volume"]].dropna()
-    df.to_parquet(out_path)
-    logger.info(
-        "Saved %s rows → %s  (%.1f MB)",
-        f"{len(df):,}", out_path, out_path.stat().st_size / 1e6,
-    )
-
-
 def pull_equity() -> None:
+    """Download 5-minute OHLCV for SPY, QQQ, VIX via yfinance (chunked)."""
+    from scanners.market_data.yfinance_provider import YFinanceProvider
+
     EQUITY_DIR.mkdir(parents=True, exist_ok=True)
+    provider = YFinanceProvider()
     today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
 
-    # SPY and QQQ: 1-minute via Alpaca
-    for ticker in ("SPY", "QQQ"):
+    for ticker in TICKERS:
+        out_path = EQUITY_DIR / f"{ticker}_5m.parquet"
+        logger.info("--- %s ---", ticker)
         try:
-            pull_equity_alpaca(ticker, today)
-        except EnvironmentError as exc:
-            logger.error("Alpaca credentials missing — %s", exc)
-            logger.error("Skipping %s 1-minute pull. Set ALPACA_API_KEY / ALPACA_SECRET_KEY in .env", ticker)
+            df = provider.get_ohlcv_chunked(
+                ticker,
+                start=DATA_START,
+                end=today,
+                interval="5m",
+            )
+            if df.empty:
+                logger.warning("No data returned for %s — skipping.", ticker)
+                continue
+
+            df.to_parquet(out_path)
+            size_mb = out_path.stat().st_size / 1e6
+            logger.info("Saved %s → %s  (%s rows, %.1f MB)", ticker, out_path.name, f"{len(df):,}", size_mb)
+
         except Exception as exc:
             logger.error("Failed to pull %s: %s", ticker, exc)
-
-    # VIX: 1-hour via yfinance (index, no free 1-minute source)
-    try:
-        pull_vix_yfinance(today)
-    except Exception as exc:
-        logger.error("Failed to pull VIX: %s", exc)
 
 
 # ===========================================================================
@@ -226,9 +179,7 @@ def discover_polymarket_markets(session: requests.Session) -> list[dict]:
 
 
 def pull_polymarket_prices(session: requests.Session, markets: list[dict]) -> None:
-    """Fetch hourly YES price history for each market and save as parquet."""
     POLY_PRICES_DIR.mkdir(parents=True, exist_ok=True)
-
     start_ts = int(DATA_START_DT.timestamp())
     end_ts = int(datetime.now(tz=timezone.utc).timestamp())
 
@@ -238,12 +189,11 @@ def pull_polymarket_prices(session: requests.Session, markets: list[dict]) -> No
         yes_token = _extract_yes_token_id(market)
 
         if not yes_token:
-            logger.debug("No YES token for market %s — skipping.", cid)
             continue
 
         out_path = POLY_PRICES_DIR / f"{cid}_YES.parquet"
         if out_path.exists():
-            logger.info("[%d/%d] Already exists: %s — skipping.", i, len(markets), question)
+            logger.info("[%d/%d] Skip (exists): %s", i, len(markets), question)
             continue
 
         logger.info("[%d/%d] Fetching: %s", i, len(markets), question)
@@ -260,15 +210,13 @@ def pull_polymarket_prices(session: requests.Session, markets: list[dict]) -> No
                 timeout=20,
             )
             resp.raise_for_status()
-            data = resp.json()
+            history = resp.json().get("history", [])
         except requests.RequestException as exc:
-            logger.warning("Price history failed for %s: %s", cid, exc)
+            logger.warning("  Failed: %s", exc)
             time.sleep(1)
             continue
 
-        history = data.get("history", [])
         if not history:
-            logger.debug("Empty price history for %s.", cid)
             continue
 
         df = pd.DataFrame(history)
@@ -285,23 +233,20 @@ def pull_polymarket_prices(session: requests.Session, markets: list[dict]) -> No
 def pull_polymarket() -> None:
     session = requests.Session()
     session.headers.update({"Accept": "application/json"})
-
     markets = discover_polymarket_markets(session)
 
     POLY_DIR.mkdir(parents=True, exist_ok=True)
-    catalog_rows = [{
+    catalog = pd.DataFrame([{
         "condition_id": m.get("condition_id", ""),
-        "question": m.get("question", ""),
-        "slug": m.get("market_slug", ""),
-        "closed": m.get("closed", False),
-        "end_date": m.get("end_date_iso", ""),
+        "question":     m.get("question", ""),
+        "slug":         m.get("market_slug", ""),
+        "closed":       m.get("closed", False),
+        "end_date":     m.get("end_date_iso", ""),
         "yes_token_id": _extract_yes_token_id(m) or "",
-    } for m in markets]
-
-    catalog_df = pd.DataFrame(catalog_rows)
+    } for m in markets])
     catalog_path = POLY_DIR / "markets_catalog.parquet"
-    catalog_df.to_parquet(catalog_path, index=False)
-    logger.info("Saved markets catalog → %s (%d markets)", catalog_path, len(catalog_df))
+    catalog.to_parquet(catalog_path, index=False)
+    logger.info("Markets catalog → %s (%d markets)", catalog_path, len(catalog))
 
     pull_polymarket_prices(session, markets)
 
@@ -319,7 +264,7 @@ def pull_truth_social() -> None:
     username = os.environ.get("TRUTHSOCIAL_USERNAME")
     password = os.environ.get("TRUTHSOCIAL_PASSWORD")
     if not username or not password:
-        logger.error("TRUTHSOCIAL_USERNAME / TRUTHSOCIAL_PASSWORD not set — skipping.")
+        logger.warning("TRUTHSOCIAL_USERNAME / TRUTHSOCIAL_PASSWORD not set — skipping Truth Social pull.")
         return
 
     TS_DIR.mkdir(parents=True, exist_ok=True)
@@ -337,13 +282,9 @@ def pull_truth_social() -> None:
                 pass
 
     api = Api(username, password)
-    new_posts = []
+    new_posts: list[dict] = []
 
-    logger.info(
-        "Fetching @%s posts since %s (may take several minutes due to rate limits)...",
-        TRUTH_SOCIAL_USER, DATA_START,
-    )
-
+    logger.info("Fetching @%s posts since %s ...", TRUTH_SOCIAL_USER, DATA_START)
     try:
         for post in api.pull_statuses(
             TRUTH_SOCIAL_USER,
@@ -352,28 +293,25 @@ def pull_truth_social() -> None:
         ):
             pid = str(post.get("id", ""))
             if last_stored_id and pid == last_stored_id:
-                logger.info("Reached previously stored post — stopping.")
+                logger.info("Reached previously stored post — done.")
                 break
             new_posts.append(post)
-
             if len(new_posts) % 40 == 0:
-                logger.info("  Fetched %d posts so far, pausing for rate limits...", len(new_posts))
+                logger.info("  %d posts fetched, pausing 25s for rate limits...", len(new_posts))
                 time.sleep(25)
-
     except Exception as exc:
         logger.warning("Truth Social fetch interrupted: %s", exc)
 
     if not new_posts:
-        logger.info("No new posts found.")
+        logger.info("No new posts to store.")
         return
 
-    new_posts.reverse()  # API returns newest-first → store chronologically
+    new_posts.reverse()
     mode = "a" if out_path.exists() else "w"
     with open(out_path, mode, encoding="utf-8") as f:
         for post in new_posts:
             f.write(json.dumps(post, default=str) + "\n")
-
-    logger.info("Saved %d new posts → %s", len(new_posts), out_path)
+    logger.info("Saved %d posts → %s", len(new_posts), out_path)
 
 
 # ===========================================================================
@@ -383,31 +321,29 @@ def pull_truth_social() -> None:
 def main() -> None:
     logger.info("=" * 60)
     logger.info("WhaleWatch_Alpha — Historical Data Pull")
-    logger.info("Output: %s", DATA_ROOT)
-    logger.info("Start: %s", DATA_START)
+    logger.info("Output : %s", DATA_ROOT)
+    logger.info("Start  : %s", DATA_START)
     logger.info("=" * 60)
     logger.info("")
-    logger.info("NOTE: SPY/QQQ use Alpaca 1-minute bars (requires free ALPACA_API_KEY).")
-    logger.info("      VIX uses yfinance 1-hour bars (finest free resolution for an index).")
-    logger.info("      SPY/QQQ 1m data since 2024 is ~600k rows each — allow 5-10 min per ticker.")
+    logger.info("Equity: yfinance 5-minute bars (chunked, no API key needed)")
+    logger.info("Expect ~5-15 min per ticker for 2024-present history.")
     logger.info("")
 
-    logger.info("[1/3] Pulling equity data (SPY 1m, QQQ 1m, VIX 1h)...")
+    logger.info("[1/3] Equity (SPY 5m / QQQ 5m / VIX 5m)...")
     pull_equity()
 
-    logger.info("\n[2/3] Pulling Polymarket historical prices...")
+    logger.info("\n[2/3] Polymarket historical prices...")
     pull_polymarket()
 
-    logger.info("\n[3/3] Pulling Truth Social posts...")
+    logger.info("\n[3/3] Truth Social posts...")
     pull_truth_social()
 
-    logger.info("\nDone. All data stored in %s", DATA_ROOT)
-    logger.info("")
-    logger.info("Directory summary:")
-    for p in sorted(DATA_ROOT.rglob("*")):
-        if p.is_file():
-            size_mb = p.stat().st_size / 1e6
-            logger.info("  %-55s  %.1f MB", str(p.relative_to(DATA_ROOT)), size_mb)
+    logger.info("\nDone. Files in %s:", DATA_ROOT)
+    for p in sorted(DATA_ROOT.rglob("*.parquet"), key=lambda x: x.stat().st_size, reverse=True):
+        logger.info("  %-60s  %.1f MB", str(p.relative_to(DATA_ROOT)), p.stat().st_size / 1e6)
+    jsonl = DATA_ROOT / "truth_social" / "trump_posts.jsonl"
+    if jsonl.exists():
+        logger.info("  %-60s  %.1f MB", "truth_social/trump_posts.jsonl", jsonl.stat().st_size / 1e6)
 
 
 if __name__ == "__main__":
