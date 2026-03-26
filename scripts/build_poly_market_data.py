@@ -113,6 +113,17 @@ def load_spy_prices() -> tuple[pd.DataFrame, pd.DataFrame]:
     return spy_5m, spy_1h
 
 
+def load_vixy_prices() -> pd.DataFrame:
+    """Load VIXY 5m from Polygon (intraday VIX proxy)."""
+    path = EQUITY_DIR / "VIXY_5m_poly.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    df = pd.read_parquet(path)
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC")
+    return df.sort_index()
+
+
 def load_vix_data() -> tuple[pd.Series, pd.Series]:
     """Load VIX daily close and rolling percentile via yfinance."""
     import yfinance as yf
@@ -220,6 +231,7 @@ def build_sessions(
             "max_price_delta":        float(events["price_delta"].abs().max()),
             "cumulative_delta":       cum_delta,
             "net_delta_abs":          abs(cum_delta),
+            "dominant_direction":     dom_sign,          # +1 YES rising / -1 YES falling
             "n_events":               len(events),
             "n_markets":              int(events["condition_id"].nunique()),
             "n_corroborating":        len(same_dir),
@@ -261,12 +273,24 @@ def add_vix_features(
     sessions: pd.DataFrame,
     vix_close: pd.Series,
     vix_pct: pd.Series,
+    vixy_5m: pd.DataFrame,
 ) -> pd.DataFrame:
     date_strs = sessions["session_time"].dt.date.astype(str)
     vix_map   = {str(d): v for d, v in zip(vix_close.index.date, vix_close.values)}
     pct_map   = {str(d): v for d, v in zip(vix_pct.index.date, vix_pct.values)}
     sessions["vix_level"]      = date_strs.map(vix_map)
     sessions["vix_percentile"] = date_strs.map(pct_map)
+
+    # VIXY intraday price: nearest 5m bar at or before session start
+    if not vixy_5m.empty:
+        vixy_levels = []
+        for ts in sessions["session_time"]:
+            past = vixy_5m.index[vixy_5m.index <= ts]
+            vixy_levels.append(float(vixy_5m.loc[past[-1], "close"]) if len(past) > 0 else None)
+        sessions["vixy_level"] = vixy_levels
+    else:
+        sessions["vixy_level"] = None
+
     return sessions
 
 
@@ -359,8 +383,10 @@ def run(session_window_min: int, price_delta: float) -> None:
         return
     logger.info("  SPY 5m: %d bars  1h: %d bars", len(spy_5m), len(spy_1h))
 
-    logger.info("Loading VIX data...")
+    logger.info("Loading VIX/VIXY data...")
     vix_close, vix_pct = load_vix_data()
+    vixy_5m = load_vixy_prices()
+    logger.info("  VIXY 5m: %d bars%s", len(vixy_5m), "" if not vixy_5m.empty else " (not found — vixy_level will be null)")
 
     # Detect anomalies for every market
     all_anomalies: list[pd.DataFrame] = []
@@ -395,7 +421,7 @@ def run(session_window_min: int, price_delta: float) -> None:
 
     # Feature engineering
     sessions = add_temporal_features(sessions)
-    sessions = add_vix_features(sessions, vix_close, vix_pct)
+    sessions = add_vix_features(sessions, vix_close, vix_pct, vixy_5m)
 
     # SPY returns
     logger.info("Computing SPY forward returns...")

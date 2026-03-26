@@ -154,12 +154,14 @@ class SessionManager:
         min_confidence: float = 0.60,
         vix_level: float = 20.0,
         vix_percentile: float = 0.5,
+        vixy_level: float = 0.0,
         model_period: str = "1h",
     ) -> None:
         self._timeout_min    = session_timeout_min
         self._min_confidence = min_confidence
         self._vix_level      = vix_level
         self._vix_percentile = vix_percentile
+        self._vixy_level     = vixy_level
         self._model_period   = model_period
 
         self._events:     List[PolymarketRawEvent]          = []
@@ -197,12 +199,13 @@ class SessionManager:
             period, MODELS_DIR,
         )
 
-    def update_vix(self, vix_level: float, vix_percentile: float) -> None:
+    def update_vix(self, vix_level: float, vix_percentile: float, vixy_level: float = 0.0) -> None:
         """Update market regime; reload model if regime boundary crossed."""
-        old_regime   = "high" if self._vix_level >= 20 else "low"
-        new_regime   = "high" if vix_level >= 20 else "low"
+        old_regime           = "high" if self._vix_level >= 20 else "low"
+        new_regime           = "high" if vix_level >= 20 else "low"
         self._vix_level      = vix_level
         self._vix_percentile = vix_percentile
+        self._vixy_level     = vixy_level
         if old_regime != new_regime:
             logger.info("VIX regime change (%s → %s); reloading model", old_regime, new_regime)
             self._load_model(self._model_period)
@@ -304,25 +307,27 @@ class SessionManager:
         )
 
         return {
-            "max_price_delta":     max(abs(e.price_delta) for e in events),
-            "cumulative_delta":    cum_delta,
-            "net_delta_abs":       abs(cum_delta),
-            "n_events":            len(events),
-            "n_markets":           len({e.market_id for e in events}),
-            "n_corroborating":     n_corr,
-            "n_opposing":          len(events) - n_corr,
-            "corroboration_ratio": n_corr / max(len(events), 1),
+            "max_price_delta":      max(abs(e.price_delta) for e in events),
+            "cumulative_delta":     cum_delta,
+            "net_delta_abs":        abs(cum_delta),
+            "dominant_direction":   1 if cum_delta >= 0 else -1,
+            "n_events":             len(events),
+            "n_markets":            len({e.market_id for e in events}),
+            "n_corroborating":      n_corr,
+            "n_opposing":           len(events) - n_corr,
+            "corroboration_ratio":  n_corr / max(len(events), 1),
             "session_duration_min": duration,
-            "has_tariff":          int("tariff" in topics),
-            "has_geopolitical":    int("geopolitical" in topics),
-            "has_fed":             int("fed" in topics),
-            "has_energy":          int("energy" in topics),
-            "has_executive":       int("executive" in topics),
-            "vix_level":           self._vix_level,
-            "vix_percentile":      self._vix_percentile,
-            "is_market_hours":     int(9 <= local_ts.hour < 16 and local_ts.weekday() < 5),
-            "hour_of_day":         local_ts.hour,
-            "day_of_week":         local_ts.weekday(),
+            "has_tariff":           int("tariff" in topics),
+            "has_geopolitical":     int("geopolitical" in topics),
+            "has_fed":              int("fed" in topics),
+            "has_energy":           int("energy" in topics),
+            "has_executive":        int("executive" in topics),
+            "vix_level":            self._vix_level,
+            "vix_percentile":       self._vix_percentile,
+            "vixy_level":           self._vixy_level,
+            "is_market_hours":      int(9 <= local_ts.hour < 16 and local_ts.weekday() < 5),
+            "hour_of_day":          local_ts.hour,
+            "day_of_week":          local_ts.weekday(),
         }
 
     def _score(self, feature_dict: dict) -> tuple[str, float, int]:
@@ -429,9 +434,9 @@ class PolymarketScanner(BaseScanner):
 
             time.sleep(self._poll_interval)
 
-    def update_vix(self, vix_level: float, vix_percentile: float) -> None:
-        """Inject current VIX into the session manager (call periodically)."""
-        self._session_mgr.update_vix(vix_level, vix_percentile)
+    def update_vix(self, vix_level: float, vix_percentile: float, vixy_level: float = 0.0) -> None:
+        """Inject current VIX/VIXY into the session manager (call periodically)."""
+        self._session_mgr.update_vix(vix_level, vix_percentile, vixy_level)
 
     # ------------------------------------------------------------------
     # Watchlist discovery

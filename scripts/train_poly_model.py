@@ -49,15 +49,16 @@ HOLDING_PERIODS = ["5m", "30m", "1h", "2h", "4h", "1d"]
 
 # Session strength — how strong and broad was the Polymarket move
 STRENGTH_FEATURES = [
-    "max_price_delta",       # single largest price move in session
-    "cumulative_delta",      # net directional sum
-    "net_delta_abs",         # absolute sum (always positive, captures magnitude)
+    "max_price_delta",       # single largest price move — whale size proxy
+    "cumulative_delta",      # net directional sum (signed)
+    "net_delta_abs",         # absolute cumulative magnitude
+    "dominant_direction",    # +1 YES rising / -1 YES falling (separates direction from magnitude)
     "n_events",              # total anomaly events in session
-    "n_markets",             # distinct markets involved
+    "n_markets",             # distinct markets involved (cross-market coordination = whale thesis)
     "n_corroborating",       # events in dominant direction (reinforcement count)
-    "n_opposing",            # counter-events (uncertainty signal)
-    "corroboration_ratio",   # n_corroborating / n_events
-    "session_duration_min",  # time from first to last event
+    "n_opposing",            # counter-events (uncertainty / split-whale signal)
+    "corroboration_ratio",   # n_corroborating / n_events — purity of directional bet
+    "session_duration_min",  # short+large = single whale entry; long = accumulation
 ]
 
 # Topic composition — which buckets fired
@@ -71,8 +72,9 @@ TOPIC_FEATURES = [
 
 # Market regime at session time
 REGIME_FEATURES = [
-    "vix_level",
-    "vix_percentile",
+    "vix_level",        # VIX absolute level — low VIX = cleaner signal environment
+    "vix_percentile",   # VIX relative to history
+    "vixy_level",       # VIXY intraday price — real-time VIX proxy (fear barometer at session time)
     "is_market_hours",
     "hour_of_day",
     "day_of_week",
