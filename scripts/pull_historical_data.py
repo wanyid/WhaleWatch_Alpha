@@ -187,13 +187,14 @@ def _extract_yes_token_id(market: dict) -> str | None:
 def discover_polymarket_markets(session: requests.Session) -> list[dict]:
     """Fetch all relevant markets (active + closed) from Gamma API.
 
-    Server-side filters applied to keep discovery tractable:
-      - closed markets: end_date_min=DATA_START (skip pre-2024 markets)
-      - closed markets: volume_num_min=1000 (skip micro-markets with no whale activity)
+    Server-side filters for closed markets:
+      - end_date_min=2025-01-20: only markets that closed after Trump inauguration
+        (matches our training data floor; avoids pre-inauguration regime)
+      - volume_num_min=50000: only whale-scale markets ($50k+ total volume)
 
-    Without these filters, Gamma has 150k+ closed markets since 2024 — would
-    take hours to page through.  volume_num_min=1000 cuts this to ~hundreds of
-    pages while keeping all meaningful markets.
+    At volume_num_min=1000 there were still 150k+ pages to crawl (hours).
+    Raising to 50k cuts to the markets whales actually trade.
+    Active markets: no volume filter (all politically-relevant open markets kept).
     """
     relevant = []
     limit = 100
@@ -203,8 +204,8 @@ def discover_polymarket_markets(session: requests.Session) -> list[dict]:
         pages = 0
         base_params: dict = {"closed": str(closed).lower(), "limit": limit}
         if closed:
-            base_params["end_date_min"] = DATA_START   # skip pre-2024 markets
-            base_params["volume_num_min"] = 1000        # skip micro-markets
+            base_params["end_date_min"] = "2025-01-20"  # Trump inauguration = training floor
+            base_params["volume_num_min"] = 50000        # whale-scale only
 
         while True:
             try:
