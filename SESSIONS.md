@@ -225,3 +225,56 @@ python scripts/pull_historical_data.py
 - **VIX 5m data**: yfinance returns ~2× more rows than SPY/QQQ for the same period (8,887 vs ~4,557) — likely because VIX trades extended hours. Filter to market hours if needed for signal alignment.
 - **Truth Social rate limiting**: Cloudflare blocks after ~40 rapid requests. Script pauses 25s every 40 posts automatically. Needs credentials in `.env`.
 - **SECRETS — NEVER PUSH TO GITHUB**: `.env` AND `.env.example` are both gitignored and must never be committed. `.env.example` may contain real credentials. Both files are blocked in `.gitignore`.
+
+---
+
+## Session 3 — 2026-03-26 (overnight build)
+
+### Key Decisions / Changes
+
+| Area | Decision | Rationale |
+|------|----------|-----------|
+| Truth Social | Confirmed `truthbrush` works with `LoeWongtoe` account; `created_after` requires `datetime` object not string | Tested live — auth tokens issued, posts fetched |
+| Secrets | `.env.example` gitignored permanently; credentials scrubbed from file | Real creds were accidentally stored in example file |
+| Gamma closed filter | Tightened to `end_date_min=2025-01-20` + `volume_num_min=50000` | `volume_num_min=1000` still left 100k+ pages; 50k limit cuts to whale-relevant markets while keeping the inauguration-aligned training window |
+| `main.py` architecture | Scanner threads + Queue + pipeline function + periodic sweep | Decoupled from scanner implementation; graceful SIGINT/SIGTERM shutdown |
+| Paper executor storage | SQLite (not CSV) with `positions` + `daily_pnl` tables | Supports concurrent writes, easy ad-hoc queries, natural upsert for daily aggregation |
+| Backtester price lookup | Uses stored `{TICKER}_1d.parquet` OHLCV; falls back to entry price if missing | Keeps backtester self-contained; no live API calls needed for replay |
+
+### Files Built This Session
+
+| File | Status | Description |
+|------|--------|-------------|
+| `executor/base_executor.py` | ✅ Done | Abstract interface |
+| `executor/paper_executor.py` | ✅ Done | SQLite paper trading + P&L |
+| `executor/alpaca_executor.py` | ✅ Stub | Future live broker |
+| `risk/risk_manager.py` | ✅ Done | Confidence gate + circuit breaker |
+| `backtest/backtester.py` | ✅ Done | Historical replay from SQLite |
+| `main.py` | ✅ Done | Full orchestration loop |
+| `tests/test_risk_executor.py` | ✅ Done | 12 passing smoke tests |
+
+### Commits This Session
+
+| Hash | Message |
+|------|---------|
+| `6b4f888` | `config`: block .env.example from git — never commit secrets |
+| `56cad2b` | `feat(executor,risk,backtest)`: paper executor + risk manager + backtester + main loop |
+| `80ca6d2` | `test(executor,risk)`: 12 smoke tests for RiskManager + PaperExecutor |
+
+### Data Pull Status (Session 3)
+
+| Source | Status | Notes |
+|--------|--------|-------|
+| Equity (all 6 files) | ✅ Done | Unchanged |
+| Polymarket catalog | ⏳ Running | Closed market discovery in progress with tightened filters |
+| Polymarket prices | ⏳ Pending | Will start after discovery completes |
+| Truth Social | ⏳ Pending | Will run after Polymarket; credentials confirmed working |
+
+### Next Steps (for next session)
+
+- [ ] Verify data pull completed successfully — check `D:/WhaleWatch_Data/polymarket/prices/` file count
+- [ ] Label historical Polymarket events (map closed markets → SPY/QQQ/VIX moves at signal time → `outcome`)
+- [ ] Build `scripts/label_events.py` — backfill `market_price_at_signal`, `market_price_exit`, `realized_pnl`, `outcome`
+- [ ] Train Layer 2 once ≥10 labeled events exist (`stat_predictor.py` `fit()` method)
+- [ ] Add ANTHROPIC_API_KEY to `.env` and do an end-to-end `python main.py --once` smoke test
+- [ ] Monitor paper trading session when market opens
