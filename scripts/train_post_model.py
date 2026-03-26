@@ -44,6 +44,13 @@ from sklearn.metrics import (
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 
+# ---------------------------------------------------------------------------
+# Train/OOS split cutoff
+# ---------------------------------------------------------------------------
+# Data up to and including this date is used for training.
+# Data after this date is held out as the out-of-sample (OOS) test set.
+TRAIN_CUTOFF = pd.Timestamp("2026-02-28")
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 logging.basicConfig(
@@ -234,10 +241,28 @@ def _build_pipeline(model_type: str = "xgboost"):
 def _build_calibrated_model(X, y, model_type: str = "xgboost", sample_weight=None):
     pipe   = _build_pipeline(model_type)
     method = "isotonic" if len(y) >= 50 else "sigmoid"
-    cal    = CalibratedClassifierCV(pipe, method=method, cv=3)
+    # Use TimeSeriesSplit so calibration folds respect time order — avoids
+    # future data leaking into earlier calibration folds.
+    cal    = CalibratedClassifierCV(pipe, method=method, cv=TimeSeriesSplit(n_splits=3))
     fit_kw = {"clf__sample_weight": sample_weight} if sample_weight is not None else {}
     cal.fit(X, y, **fit_kw)
     return cal
+
+
+def _oos_metrics(model, X_oos: np.ndarray, y_oos: np.ndarray) -> dict:
+    """Evaluate a fitted model on the held-out OOS set."""
+    if len(y_oos) == 0 or len(np.unique(y_oos)) < 2:
+        return {"oos_n": len(y_oos), "oos_note": "insufficient OOS data"}
+    y_prob = model.predict_proba(X_oos)[:, 1]
+    y_pred = (y_prob >= 0.5).astype(int)
+    return {
+        "oos_n":         int(len(y_oos)),
+        "oos_pos_rate":  round(float(y_oos.mean()), 4),
+        "oos_auc_roc":   round(float(roc_auc_score(y_oos, y_prob)), 4),
+        "oos_accuracy":  round(float(accuracy_score(y_oos, y_pred)), 4),
+        "oos_brier":     round(float(brier_score_loss(y_oos, y_prob)), 4),
+        "oos_log_loss":  round(float(log_loss(y_oos, y_prob)), 4),
+    }
 
 
 def _decay_weights(df_valid: pd.DataFrame, decay_half_days: int) -> np.ndarray:
@@ -332,6 +357,7 @@ def _save_model(
     cal_model, period: str, ret_col: str, n: int, n_pos: int,
     metrics: dict, rolling_window: int, model_type: str,
     suffix: str = "", extra_meta: dict | None = None,
+    oos_metrics: dict | None = None,
 ) -> None:
     model_path = MODELS_DIR / f"spy_direction_{period}{suffix}.pkl"
     payload = {
@@ -343,8 +369,10 @@ def _save_model(
         "rolling_window": rolling_window,
         "dead_zone_pct":  DEAD_ZONE[period] * 100,
         "n_train":        n,
+        "train_cutoff":   str(TRAIN_CUTOFF.date()),
         "pos_rate":       round(n_pos / n, 4) if n > 0 else 0.0,
         "cv_metrics":     metrics,
+        "oos_metrics":    oos_metrics or {},
         "model_type":     model_type,
         **(extra_meta or {}),
     }
@@ -370,7 +398,23 @@ def run(
     Both can be combined with the baseline run.
     """
     df_raw = _load_data(min_keywords=min_keywords)
+    # Compute excess returns on the full dataset so rolling baselines for OOS
+    # rows are anchored on real prior observations (no leakage — shift-1 used).
     df     = _compute_excess_returns(df_raw, rolling_window=rolling_window)
+
+    # Train / OOS split
+    ts_col = "posted_at" if "posted_at" in df.columns else None
+    if ts_col:
+        df_train = df[df[ts_col] <= TRAIN_CUTOFF].copy()
+        df_oos   = df[df[ts_col] >  TRAIN_CUTOFF].copy()
+        logger.info(
+            "Train/OOS split at %s  →  train=%d rows  OOS=%d rows",
+            TRAIN_CUTOFF.date(), len(df_train), len(df_oos),
+        )
+    else:
+        logger.warning("No 'posted_at' column — using all data for training, no OOS split")
+        df_train = df.copy()
+        df_oos   = df.iloc[0:0].copy()   # empty
 
     # Log baseline stats for transparency
     logger.info(
@@ -386,23 +430,23 @@ def run(
 
     for period in target_periods:
         ret_col = HOLDING_PERIODS.get(period)
-        if ret_col is None or ret_col not in df.columns:
+        if ret_col is None or ret_col not in df_train.columns:
             logger.warning("Unknown/missing period '%s' — skipping", period)
             continue
 
         try:
-            X, y, df_valid = _build_label(df, period, ret_col)
+            X, y, df_valid = _build_label(df_train, period, ret_col)
         except Exception as exc:
             logger.error("Label build failed for %s: %s", period, exc)
             continue
 
         n       = len(y)
         n_pos   = int(y.sum())
-        n_total = int(df[ret_col].notna().sum())
+        n_total = int(df_train[ret_col].notna().sum())
         dropped = n_total - n
 
         logger.info(
-            "Period %-4s  raw=%-4d  after_dead_zone=%-4d (dropped %d=%.0f%%)  "
+            "Period %-4s  train: raw=%-4d  after_dead_zone=%-4d (dropped %d=%.0f%%)  "
             "pos_rate=%.1f%%  (BUY=%-3d  SHORT=%-3d)",
             period, n_total, n, dropped, dropped / max(n_total, 1) * 100,
             n_pos / n * 100 if n > 0 else 0, n_pos, n - n_pos,
@@ -415,15 +459,24 @@ def run(
         metrics = _cross_validate(X, y, n_folds, model_type)
 
         print(f"\n{'=' * 65}")
-        print(f"  Period: {period}  |  dead_zone=±{DEAD_ZONE[period]*100:.2f}%  |  n={n}")
+        print(f"  Period: {period}  |  dead_zone=±{DEAD_ZONE[period]*100:.2f}%  |  train n={n}")
         print(f"{'=' * 65}")
         for k, v in metrics.items():
             print(f"  {k:25s}: {v}")
 
+        # Build OOS labels using the same dead-zone rules
+        oos_m: dict = {}
+        if len(df_oos) > 0 and ret_col in df_oos.columns:
+            try:
+                X_oos, y_oos, _ = _build_label(df_oos, period, ret_col)
+                logger.info("  OOS: %d rows after dead-zone filter", len(y_oos))
+            except Exception:
+                X_oos, y_oos = np.empty((0, len(ALL_FEATURES))), np.array([])
+
         summary_rows.append({
-            "period":       period,
-            "n_after_filter": n,
-            "pct_kept":     round(n / max(n_total, 1) * 100, 1),
+            "period":         period,
+            "n_train":        n,
+            "pct_kept":       round(n / max(n_total, 1) * 100, 1),
             **{k: v for k, v in metrics.items()
                if k not in ("cv_folds", "cv_type", "model", "error", "n_samples")},
         })
@@ -431,13 +484,20 @@ def run(
         if report_only:
             continue
 
-        # Fit final calibrated model on all filtered data
+        # Fit final calibrated model on training data only
         logger.info("Fitting final calibrated model for %s ...", period)
         try:
             cal_model = _build_calibrated_model(X, y, model_type)
         except Exception as exc:
             logger.error("Failed to fit calibrated model for %s: %s", period, exc)
             continue
+
+        # OOS evaluation
+        if len(df_oos) > 0:
+            oos_m = _oos_metrics(cal_model, X_oos, y_oos)
+            print(f"\n  OOS evaluation (after {TRAIN_CUTOFF.date()}):")
+            for k, v in oos_m.items():
+                print(f"    {k:25s}: {v}")
 
         # In-sample calibration sanity check
         if n >= 20:
@@ -463,7 +523,8 @@ def run(
 
         # Save baseline model
         _save_model(cal_model, period, ret_col, n, n_pos,
-                    metrics, rolling_window, model_type, suffix="")
+                    metrics, rolling_window, model_type, suffix="",
+                    oos_metrics=oos_m)
 
         # ---- Option B: regime-split models ----
         if regime:
@@ -483,11 +544,24 @@ def run(
                 print(f"\n  [Regime: {regime_name} VIX{'>='+str(vix_threshold) if 'high' in regime_name else '<'+str(vix_threshold)}]"
                       f"  n={n_r}  AUC={m_r.get('auc_roc','?')}")
                 cal_r = _build_calibrated_model(X_r, y_r, model_type)
+                # OOS for regime sub-model
+                oos_r: dict = {}
+                if len(df_oos) > 0 and len(X_oos) > 0:
+                    oos_mask = vix_mask_fn(df_oos) if "vix_level" in df_oos.columns else pd.Series(True, index=df_oos.index)
+                    # Re-derive OOS labels for this regime slice from df_oos filtered
+                    df_oos_r = df_oos[oos_mask]
+                    if len(df_oos_r) > 0:
+                        try:
+                            X_oos_r, y_oos_r, _ = _build_label(df_oos_r, period, ret_col)
+                            oos_r = _oos_metrics(cal_r, X_oos_r, y_oos_r)
+                        except Exception:
+                            pass
                 _save_model(cal_r, period, ret_col, n_r, int(y_r.sum()),
                             m_r, rolling_window, model_type,
                             suffix=f"_{regime_name}",
                             extra_meta={"vix_threshold": vix_threshold,
-                                        "regime": regime_name})
+                                        "regime": regime_name},
+                            oos_metrics=oos_r)
 
         # ---- Option C: decay-weighted model ----
         if decay_half_days > 0:
@@ -499,12 +573,13 @@ def run(
             _save_model(cal_w, period, ret_col, n, n_pos,
                         m_w, rolling_window, model_type,
                         suffix="_weighted",
-                        extra_meta={"decay_half_days": decay_half_days})
+                        extra_meta={"decay_half_days": decay_half_days},
+                        oos_metrics=_oos_metrics(cal_w, X_oos, y_oos) if len(df_oos) > 0 and len(X_oos) > 0 else {})
 
     # Summary table
     if summary_rows:
         print(f"\n{'=' * 65}")
-        print("SUMMARY — excess-return labels, alpha-adjusted")
+        print(f"SUMMARY — train cutoff: {TRAIN_CUTOFF.date()}  |  OOS: after that date")
         print(f"{'=' * 65}")
         summary_df = pd.DataFrame(summary_rows)
         print(summary_df.to_string(index=False))
@@ -513,9 +588,9 @@ def run(
         if "auc_roc" in summary_df.columns and not summary_df["auc_roc"].isna().all():
             best = summary_df.loc[summary_df["auc_roc"].idxmax()]
             logger.info(
-                "Best period: %s  AUC=%.4f  accuracy=%.4f  n=%d (%.0f%% of data kept)",
+                "Best period: %s  AUC=%.4f  accuracy=%.4f  n_train=%d (%.0f%% of data kept)",
                 best["period"], best["auc_roc"], best.get("accuracy", float("nan")),
-                best["n_after_filter"], best["pct_kept"],
+                best["n_train"], best["pct_kept"],
             )
 
 

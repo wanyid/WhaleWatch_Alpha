@@ -30,6 +30,11 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# ---------------------------------------------------------------------------
+# Train/OOS split cutoff
+# ---------------------------------------------------------------------------
+TRAIN_CUTOFF = pd.Timestamp("2026-02-28")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -146,8 +151,13 @@ def _build_calibrated_model(
     y: pd.Series,
     sample_weight: np.ndarray | None = None,
 ):
-    """Fit XGBoost + isotonic calibration on the full dataset."""
+    """Fit XGBoost + isotonic calibration on the full dataset.
+
+    Uses TimeSeriesSplit for calibration folds so future data never contaminates
+    earlier calibration folds.
+    """
     from sklearn.calibration import CalibratedClassifierCV
+    from sklearn.model_selection import TimeSeriesSplit
     from xgboost import XGBClassifier
 
     base = XGBClassifier(
@@ -160,7 +170,7 @@ def _build_calibrated_model(
         random_state=42,
         verbosity=0,
     )
-    clf = CalibratedClassifierCV(base, method="isotonic", cv=3)
+    clf = CalibratedClassifierCV(base, method="isotonic", cv=TimeSeriesSplit(n_splits=3))
     fit_kwargs = {} if sample_weight is None else {"sample_weight": sample_weight}
     clf.fit(X, y, **fit_kwargs)
     return clf
@@ -212,8 +222,25 @@ def _save_model(
 # Training loop
 # ---------------------------------------------------------------------------
 
+def _oos_metrics_poly(model, X_oos: pd.DataFrame, y_oos: pd.Series) -> dict:
+    """Evaluate a fitted model on the held-out OOS set."""
+    from sklearn.metrics import roc_auc_score, accuracy_score, brier_score_loss
+    if len(y_oos) == 0 or y_oos.nunique() < 2:
+        return {"oos_n": int(len(y_oos)), "oos_note": "insufficient OOS data"}
+    probs = model.predict_proba(X_oos)[:, 1]
+    preds = (probs >= 0.5).astype(int)
+    return {
+        "oos_n":        int(len(y_oos)),
+        "oos_pos_rate": round(float(y_oos.mean()), 3),
+        "oos_auc":      round(float(roc_auc_score(y_oos, probs)), 3),
+        "oos_accuracy": round(float(accuracy_score(y_oos, preds)), 3),
+        "oos_brier":    round(float(brier_score_loss(y_oos, probs)), 3),
+    }
+
+
 def train_period(
-    df: pd.DataFrame,
+    df_train: pd.DataFrame,
+    df_oos: pd.DataFrame,
     period: str,
     train_regime: bool,
     vix_threshold: float,
@@ -222,11 +249,11 @@ def train_period(
     lbl_col = f"label_{period}"
     ret_col = f"ret_{period}"
 
-    if lbl_col not in df.columns:
+    if lbl_col not in df_train.columns:
         logger.warning("  %s: label column missing — skipping", period)
         return
 
-    df_valid = df[df[lbl_col].notna()].copy()
+    df_valid = df_train[df_train[lbl_col].notna()].copy()
     df_valid[lbl_col] = df_valid[lbl_col].astype(int)
 
     features = [f for f in ALL_FEATURES if f in df_valid.columns]
@@ -238,9 +265,11 @@ def train_period(
         return
 
     pos_rate = float(y.mean())
+    logger.info("  %s: n_train=%d  pos_rate=%.1f%%", period, len(y), pos_rate * 100)
 
     from xgboost import XGBClassifier
     from sklearn.calibration import CalibratedClassifierCV
+    from sklearn.model_selection import TimeSeriesSplit
 
     def model_factory():
         base = XGBClassifier(
@@ -248,15 +277,34 @@ def train_period(
             subsample=0.8, colsample_bytree=0.8,
             eval_metric="logloss", random_state=42, verbosity=0,
         )
-        return CalibratedClassifierCV(base, method="isotonic", cv=3)
+        # TimeSeriesSplit for calibration — respects temporal order within each CV fold
+        return CalibratedClassifierCV(base, method="isotonic", cv=TimeSeriesSplit(n_splits=3))
 
-    # --- Baseline (full data) ---
+    # Build OOS arrays (shared across all variants for this period)
+    X_oos_p: pd.DataFrame = pd.DataFrame()
+    y_oos_p: pd.Series    = pd.Series(dtype=int)
+    if len(df_oos) > 0 and lbl_col in df_oos.columns:
+        df_oos_v = df_oos[df_oos[lbl_col].notna()].copy()
+        df_oos_v[lbl_col] = df_oos_v[lbl_col].astype(int)
+        oos_feats = [f for f in features if f in df_oos_v.columns]
+        if oos_feats and len(df_oos_v) > 0:
+            X_oos_p = df_oos_v[oos_feats]
+            y_oos_p = df_oos_v[lbl_col]
+            logger.info("  %s: n_oos=%d  oos_pos_rate=%.1f%%",
+                        period, len(y_oos_p), float(y_oos_p.mean()) * 100)
+
+    # --- Baseline (training data only) ---
     cv = _cross_validate(X, y, model_factory)
     model = _build_calibrated_model(X, y)
+    oos_m = _oos_metrics_poly(model, X_oos_p, y_oos_p) if len(X_oos_p) > 0 else {}
     _save_model(
         model, features, period, cv, len(y), pos_rate, ret_col,
         label_method="excess_return_rolling20", suffix="",
+        extra_meta={"train_cutoff": str(TRAIN_CUTOFF.date()), "oos_metrics": oos_m},
     )
+    if oos_m:
+        logger.info("  %s OOS → AUC=%.3f  acc=%.3f  n=%d",
+                    period, oos_m.get("oos_auc", 0), oos_m.get("oos_accuracy", 0), oos_m.get("oos_n", 0))
 
     # --- Regime split ---
     if train_regime and "vix_level" in df_valid.columns:
@@ -270,13 +318,24 @@ def train_period(
             if len(y_r) < 30 or y_r.nunique() < 2:
                 logger.info("  %s %s: %d rows — skip", period, regime_name, len(y_r))
                 continue
-            cv_r   = _cross_validate(X_r, y_r, model_factory)
+            cv_r    = _cross_validate(X_r, y_r, model_factory)
             model_r = _build_calibrated_model(X_r, y_r)
+            # OOS for regime sub-model
+            oos_r: dict = {}
+            if len(X_oos_p) > 0 and "vix_level" in df_oos.columns:
+                df_oos_r = df_oos[mask_fn(df_oos)] if len(df_oos) > 0 else pd.DataFrame()
+                if len(df_oos_r) > 0 and lbl_col in df_oos_r.columns:
+                    df_oos_rv = df_oos_r[df_oos_r[lbl_col].notna()].copy()
+                    df_oos_rv[lbl_col] = df_oos_rv[lbl_col].astype(int)
+                    X_oos_r = df_oos_rv[[f for f in features if f in df_oos_rv.columns]]
+                    y_oos_r = df_oos_rv[lbl_col]
+                    oos_r   = _oos_metrics_poly(model_r, X_oos_r, y_oos_r)
             _save_model(
                 model_r, features, period, cv_r, len(y_r), float(y_r.mean()),
                 ret_col, label_method="excess_return_rolling20",
                 suffix=f"_{regime_name}",
-                extra_meta={"vix_threshold": vix_threshold, "regime": regime_name},
+                extra_meta={"vix_threshold": vix_threshold, "regime": regime_name,
+                            "train_cutoff": str(TRAIN_CUTOFF.date()), "oos_metrics": oos_r},
             )
 
     # --- Decay-weighted ---
@@ -284,11 +343,13 @@ def train_period(
         weights = _decay_weights(df_valid, decay_half)
         cv_w    = _cross_validate(X, y, model_factory, sample_weight=weights)
         model_w = _build_calibrated_model(X, y, sample_weight=weights)
+        oos_w   = _oos_metrics_poly(model_w, X_oos_p, y_oos_p) if len(X_oos_p) > 0 else {}
         _save_model(
             model_w, features, period, cv_w, len(y), pos_rate,
             ret_col, label_method="excess_return_rolling20",
             suffix="_weighted",
-            extra_meta={"decay_half_life_days": decay_half},
+            extra_meta={"decay_half_life_days": decay_half,
+                        "train_cutoff": str(TRAIN_CUTOFF.date()), "oos_metrics": oos_w},
         )
 
 
@@ -311,13 +372,27 @@ def run(
         df     = df[df["n_events"] >= min_events]
         logger.info("Filtered to n_events >= %d: %d → %d sessions", min_events, before, len(df))
 
-    # Date range
+    # Ensure chronological order (required by TimeSeriesSplit)
     if "session_time" in df.columns:
+        df = df.sort_values("session_time").reset_index(drop=True)
         logger.info(
             "Date range: %s → %s",
             df["session_time"].min().date(),
             df["session_time"].max().date(),
         )
+
+    # Train / OOS split
+    if "session_time" in df.columns:
+        df_train = df[df["session_time"] <= TRAIN_CUTOFF].copy()
+        df_oos   = df[df["session_time"] >  TRAIN_CUTOFF].copy()
+        logger.info(
+            "Train/OOS split at %s  →  train=%d sessions  OOS=%d sessions",
+            TRAIN_CUTOFF.date(), len(df_train), len(df_oos),
+        )
+    else:
+        logger.warning("No 'session_time' column — using all data for training, no OOS split")
+        df_train = df.copy()
+        df_oos   = df.iloc[0:0].copy()
 
     logger.info("\nFeature set (%d features):", len(ALL_FEATURES))
     logger.info("  Strength:  %s", STRENGTH_FEATURES)
@@ -327,22 +402,25 @@ def run(
     logger.info("\n--- Training ---")
     for period in HOLDING_PERIODS:
         logger.info("\nPeriod: %s", period)
-        train_period(df, period, train_regime, vix_threshold, decay_half)
+        train_period(df_train, df_oos, period, train_regime, vix_threshold, decay_half)
 
     # Summary table
-    logger.info("\n--- Model summary ---")
+    logger.info("\n--- Model summary (train cutoff: %s) ---", TRAIN_CUTOFF.date())
     model_files = sorted(MODELS_DIR.glob("poly_direction_*.pkl"))
     results = []
     for f in model_files:
         try:
             with open(f, "rb") as fh:
                 m = pickle.load(fh)
+            oos = m.get("oos_metrics") or {}
             results.append({
-                "file":    f.name,
-                "period":  m.get("period", ""),
-                "auc":     m["cv_metrics"]["auc"],
-                "n_train": m.get("n_train", 0),
-                "pos_pct": round(m.get("pos_rate", 0.5) * 100, 1),
+                "file":     f.name,
+                "period":   m.get("period", ""),
+                "cv_auc":   m["cv_metrics"]["auc"],
+                "oos_auc":  oos.get("oos_auc", "—"),
+                "n_train":  m.get("n_train", 0),
+                "n_oos":    oos.get("oos_n", "—"),
+                "pos_pct":  round(m.get("pos_rate", 0.5) * 100, 1),
             })
         except Exception:
             pass
