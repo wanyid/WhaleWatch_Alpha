@@ -68,6 +68,10 @@ DEAD_ZONE_PCT: dict[str, float] = {
 
 ROLLING_BASELINE_WINDOW = 20   # sessions for excess-return baseline
 
+# Volume spike detection
+VOLUME_ROLLING_WINDOW   = 20   # hours for rolling volume baseline
+VOLUME_SPIKE_THRESHOLD  = 50.0 # % above rolling avg = volume spike
+
 
 # ---------------------------------------------------------------------------
 # Data loaders
@@ -95,6 +99,21 @@ def load_price_file(condition_id: str) -> pd.DataFrame:
         return df.sort_index()
     except Exception:
         return pd.DataFrame()
+
+
+def load_volume_file(condition_id: str) -> pd.Series:
+    """Load hourly USDC volume for a market. Returns empty Series if unavailable."""
+    safe_id  = condition_id.replace("0x", "")[:24]
+    out_path = Path("D:/WhaleWatch_Data/polymarket/volume") / f"{safe_id}.parquet"
+    if not out_path.exists():
+        return pd.Series(dtype=float)
+    try:
+        df = pd.read_parquet(out_path)
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        return df["volume_usd"].sort_index()
+    except Exception:
+        return pd.Series(dtype=float)
 
 
 def load_spy_prices() -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -145,11 +164,16 @@ def detect_anomalies(
     price_series: pd.Series,
     condition_id: str,
     meta_row: pd.Series,
+    volume_series: pd.Series | None = None,
 ) -> pd.DataFrame:
     """Return one row per anomaly event in a market's price history.
 
     An anomaly is a |YES-price delta| >= PRICE_DELTA_THRESHOLD over the
     last ROLLING_WINDOW bars (i.e., a sustained directional move).
+
+    If volume_series is provided, also computes volume_spike_pct at each
+    anomaly timestamp (% above rolling average). This identifies whale-size
+    trades: price move + volume spike = high-confidence informed bet.
     """
     if len(price_series) < ROLLING_WINDOW + 1:
         return pd.DataFrame()
@@ -162,16 +186,35 @@ def detect_anomalies(
     if events.empty:
         return pd.DataFrame()
 
+    # Pre-compute volume spike % at each hour (NaN if no volume data)
+    vol_spike_map: dict = {}
+    if volume_series is not None and len(volume_series) >= 3:
+        # Rolling baseline excludes current bar (shift(1) then rolling mean)
+        vol_baseline = volume_series.shift(1).rolling(VOLUME_ROLLING_WINDOW, min_periods=3).mean()
+        for ts in events.index:
+            # Find the hourly volume bar matching this timestamp (floor to hour)
+            bar = ts.floor("1h")
+            if bar in volume_series.index and bar in vol_baseline.index:
+                baseline = vol_baseline.loc[bar]
+                vol      = volume_series.loc[bar]
+                if pd.notna(baseline) and baseline > 0:
+                    vol_spike_map[ts] = ((vol - baseline) / baseline) * 100.0
+                else:
+                    vol_spike_map[ts] = 0.0
+            else:
+                vol_spike_map[ts] = None   # volume data absent for this bar
+
     rows = []
     for ts, d in events.items():
         rows.append({
-            "condition_id":  condition_id,
-            "question":      meta_row["question"],
-            "topic_bucket":  meta_row["topic_bucket"],
-            "event_time":    ts,
-            "price_before":  float(lagged.loc[ts]),
-            "price_after":   float(price_series.loc[ts]),
-            "price_delta":   float(d),
+            "condition_id":    condition_id,
+            "question":        meta_row["question"],
+            "topic_bucket":    meta_row["topic_bucket"],
+            "event_time":      ts,
+            "price_before":    float(lagged.loc[ts]),
+            "price_after":     float(price_series.loc[ts]),
+            "price_delta":     float(d),
+            "volume_spike_pct": vol_spike_map.get(ts),   # None if no volume data
         })
     return pd.DataFrame(rows)
 
@@ -224,6 +267,13 @@ def build_sessions(
             else 0.0
         )
 
+        # Volume spike aggregation (NaN where volume data is absent)
+        vol_col = events["volume_spike_pct"].dropna() if "volume_spike_pct" in events.columns else pd.Series(dtype=float)
+        max_vol_spike  = float(vol_col.max())     if not vol_col.empty else None
+        avg_vol_spike  = float(vol_col.mean())    if not vol_col.empty else None
+        # n_volume_spikes: events where both price AND volume anomaly fired
+        n_vol_spikes   = int((vol_col >= VOLUME_SPIKE_THRESHOLD).sum()) if not vol_col.empty else 0
+
         sessions.append({
             "session_time":           anchor_time,
             "dominant_topic":         dominant_topic,
@@ -238,6 +288,10 @@ def build_sessions(
             "n_opposing":             len(opp_dir),
             "corroboration_ratio":    len(same_dir) / max(len(events), 1),
             "session_duration_min":   duration_min,
+            # Volume spike features — whale bet size signal
+            "max_volume_spike_pct":   max_vol_spike,   # None if volume data unavailable
+            "avg_volume_spike_pct":   avg_vol_spike,
+            "n_volume_spikes":        n_vol_spikes,    # events with price + volume anomaly
             # Topic flags (one-hot, non-exclusive)
             "has_tariff":             int((events["topic_bucket"] == "tariff").any()),
             "has_geopolitical":       int((events["topic_bucket"] == "geopolitical").any()),
@@ -390,15 +444,23 @@ def run(session_window_min: int, price_delta: float) -> None:
 
     # Detect anomalies for every market
     all_anomalies: list[pd.DataFrame] = []
-    n_loaded = 0
+    n_loaded = n_with_volume = 0
     for _, row in meta.iterrows():
         prices = load_price_file(row["condition_id"])
         if prices.empty:
             continue
-        anomalies = detect_anomalies(prices["price"], row["condition_id"], row)
+        volume = load_volume_file(row["condition_id"])
+        if not volume.empty:
+            n_with_volume += 1
+        anomalies = detect_anomalies(
+            prices["price"], row["condition_id"], row,
+            volume_series=volume if not volume.empty else None,
+        )
         if not anomalies.empty:
             all_anomalies.append(anomalies)
             n_loaded += 1
+
+    logger.info("  %d/%d markets have volume data", n_with_volume, n_loaded)
 
     if not all_anomalies:
         logger.error("No anomaly events detected. Run pull_polymarket_history.py first.")

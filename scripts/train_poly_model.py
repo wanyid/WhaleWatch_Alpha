@@ -59,6 +59,10 @@ STRENGTH_FEATURES = [
     "n_opposing",            # counter-events (uncertainty / split-whale signal)
     "corroboration_ratio",   # n_corroborating / n_events — purity of directional bet
     "session_duration_min",  # short+large = single whale entry; long = accumulation
+    # Volume features — bet size signal (None/NaN where trade history unavailable)
+    "max_volume_spike_pct",  # largest volume anomaly in session vs rolling avg
+    "avg_volume_spike_pct",  # average volume spike across session events
+    "n_volume_spikes",       # events with BOTH price AND volume anomaly (strongest whale signal)
 ]
 
 # Topic composition — which buckets fired

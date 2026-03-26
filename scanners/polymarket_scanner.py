@@ -306,6 +306,13 @@ class SessionManager:
             __import__("zoneinfo").ZoneInfo("America/New_York")
         )
 
+        # Volume spike aggregation from raw events
+        # volume_spike_pct is computed live from Gamma 24h volume in _poll_and_detect
+        vol_spikes    = [e.volume_spike_pct for e in events if e.volume_spike_pct > 0]
+        max_vol_spike = max(vol_spikes) if vol_spikes else 0.0
+        avg_vol_spike = sum(vol_spikes) / len(vol_spikes) if vol_spikes else 0.0
+        n_vol_spikes  = sum(1 for e in events if e.volume_spike_pct >= 50.0)
+
         return {
             "max_price_delta":      max(abs(e.price_delta) for e in events),
             "cumulative_delta":     cum_delta,
@@ -317,6 +324,9 @@ class SessionManager:
             "n_opposing":           len(events) - n_corr,
             "corroboration_ratio":  n_corr / max(len(events), 1),
             "session_duration_min": duration,
+            "max_volume_spike_pct": max_vol_spike,
+            "avg_volume_spike_pct": avg_vol_spike,
+            "n_volume_spikes":      n_vol_spikes,
             "has_tariff":           int("tariff" in topics),
             "has_geopolitical":     int("geopolitical" in topics),
             "has_fed":              int("fed" in topics),
