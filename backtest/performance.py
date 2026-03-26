@@ -136,12 +136,19 @@ class PerformanceMetrics:
     avg_loss_pct: float = 0.0
     profit_factor: float = 0.0     # gross wins / gross losses
 
-    # Return stats
+    # Return stats (gross — before transaction costs)
     total_pnl_pct: float = 0.0
     avg_pnl_pct: float = 0.0
     std_pnl_pct: float = 0.0
     best_trade_pct: float = 0.0
     worst_trade_pct: float = 0.0
+
+    # Transaction cost stats (populated when net_pnl column present)
+    total_cost_pct: float = 0.0     # sum of all trade costs
+    avg_cost_per_trade: float = 0.0 # mean cost per trade
+    net_pnl_pct: float = 0.0        # total_pnl - total_cost
+    net_win_rate: float = 0.0       # win rate after cost
+    trades_turned_loss: int = 0     # wins flipped to losses by costs
 
     # Risk-adjusted
     sharpe: float = 0.0
@@ -185,6 +192,17 @@ def compute_metrics(df: pd.DataFrame) -> PerformanceMetrics:
     m.std_pnl_pct = float(pnl.std(ddof=1)) if len(pnl) > 1 else 0.0
     m.best_trade_pct = float(pnl.max())
     m.worst_trade_pct = float(pnl.min())
+
+    # Transaction cost stats (populated when CostModel.apply() has been called)
+    if "trade_cost" in df.columns and "net_pnl" in df.columns:
+        m.total_cost_pct = float(df["trade_cost"].sum())
+        m.avg_cost_per_trade = float(df["trade_cost"].mean())
+        m.net_pnl_pct = float(df["net_pnl"].sum())
+        if "net_outcome" in df.columns:
+            m.net_win_rate = float((df["net_outcome"] == "WIN").mean())
+            m.trades_turned_loss = int(
+                ((df["outcome"] == "WIN") & (df["net_outcome"] != "WIN")).sum()
+            )
 
     wins_pnl = df.loc[df["outcome"] == "WIN", "realized_pnl"].values
     losses_pnl = df.loc[df["outcome"] != "WIN", "realized_pnl"].values
@@ -418,7 +436,14 @@ def print_report(m: PerformanceMetrics) -> None:
     print(f"  Win rate              : {m.win_rate:.1%}")
     print(f"  Profit factor         : {m.profit_factor:.2f}")
     print()
-    print(f"  Total P&L             : {m.total_pnl_pct:+.4f}  ({m.total_pnl_pct*100:+.2f}%)")
+    print(f"  Total P&L (gross)     : {m.total_pnl_pct:+.4f}  ({m.total_pnl_pct*100:+.2f}%)")
+    if m.total_cost_pct:
+        print(f"  Total cost            : {m.total_cost_pct:-.4f}  ({m.total_cost_pct*100:.2f}%)"
+              f"  avg {m.avg_cost_per_trade*10000:.2f} bps/trade")
+        print(f"  Total P&L (net)       : {m.net_pnl_pct:+.4f}  ({m.net_pnl_pct*100:+.2f}%)")
+        print(f"  Net win rate          : {m.net_win_rate:.1%}"
+              f"  (gross {m.win_rate:.1%},"
+              f" {m.trades_turned_loss} wins flipped to losses)")
     print(f"  Avg P&L / trade       : {m.avg_pnl_pct:+.4f}  ({m.avg_pnl_pct*100:+.2f}%)")
     print(f"  Avg win               : {m.avg_win_pct:+.4f}  ({m.avg_win_pct*100:+.2f}%)")
     print(f"  Avg loss              : {m.avg_loss_pct:+.4f}  ({m.avg_loss_pct*100:+.2f}%)")

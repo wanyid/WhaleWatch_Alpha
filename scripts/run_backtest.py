@@ -32,6 +32,7 @@ from backtest.performance import (
     optimize_stop_loss,
     print_report,
 )
+from backtest.transaction_costs import CostModel
 
 logging.basicConfig(
     level=logging.INFO,
@@ -84,7 +85,20 @@ def run(
         logger.warning("No trades in date range — run label_events.py first")
         return
 
-    # --- Full performance report ---
+    # --- Apply transaction costs ---
+    costs = CostModel()
+    df = costs.apply(df)
+    cost_summary = costs.summary(df)
+    logger.info(
+        "Transaction costs: gross_pnl=%.4f  total_cost=%.4f  net_pnl=%.4f"
+        "  trades_turned_loss=%d",
+        cost_summary["gross_pnl"],
+        cost_summary["total_cost"],
+        cost_summary["net_pnl"],
+        cost_summary["trades_turned_loss"],
+    )
+
+    # --- Full performance report (includes cost breakdown) ---
     m = compute_metrics(df)
     print_report(m)
 

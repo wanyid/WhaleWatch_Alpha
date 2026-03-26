@@ -310,10 +310,14 @@ def _post_to_event(post: pd.Series):
         ts = ts.replace(tzinfo=_tz.utc)
 
     keywords = post.get("keywords", [])
-    if not isinstance(keywords, list):
+    if isinstance(keywords, np.ndarray):
+        keywords = keywords.tolist()
+    elif not isinstance(keywords, list):
         try:
             import ast
             keywords = ast.literal_eval(str(keywords))
+            if not isinstance(keywords, list):
+                keywords = [keywords]
         except Exception:
             keywords = []
 

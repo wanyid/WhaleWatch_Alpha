@@ -30,6 +30,7 @@ Usage:
 import argparse
 import logging
 import sqlite3
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -37,6 +38,9 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from backtest.transaction_costs import CostModel
 
 logging.basicConfig(
     level=logging.INFO,
@@ -439,6 +443,24 @@ def run(report_only: bool = False, db_path: Optional[str] = None) -> Optional[pd
     if df.empty:
         logger.warning("All rows dropped during cleaning — check data quality")
         return None
+
+    # Apply transaction costs — replace realized_pnl and outcome with net values
+    # so the model trains on what it would actually earn after costs.
+    costs = CostModel()
+    df = costs.apply(df)
+    cost_summary = costs.summary(df)
+    logger.info(
+        "Transaction costs applied: gross_pnl=%.4f  total_cost=%.4f  net_pnl=%.4f"
+        "  trades_turned_loss=%d  net_win_rate=%.1f%%",
+        cost_summary["gross_pnl"],
+        cost_summary["total_cost"],
+        cost_summary["net_pnl"],
+        cost_summary["trades_turned_loss"],
+        cost_summary["net_win_rate"] * 100,
+    )
+    # Promote net values to the training labels so the model learns net returns
+    df["realized_pnl"] = df["net_pnl"]
+    df["outcome"] = df["net_outcome"]
 
     # Quality report
     quality_report(df)
