@@ -22,6 +22,15 @@ from typing import Optional
 import pandas as pd
 import yaml
 
+from backtest.performance import (
+    PerformanceMetrics,
+    compute_metrics,
+    optimize_confidence,
+    optimize_stop_loss,
+    optimize_bet_size,
+    print_report,
+)
+
 logger = logging.getLogger(__name__)
 
 _SETTINGS_PATH = "config/settings.yaml"
@@ -168,6 +177,68 @@ class Backtester:
         summary = results.summary()
         logger.info("Backtest complete: %s", summary)
         return results
+
+    def performance(self, results: BacktestResults) -> PerformanceMetrics:
+        """Compute full performance metrics for a completed backtest."""
+        df = results.to_dataframe()
+        if df.empty:
+            return PerformanceMetrics()
+        # Map TradeResult fields to the column names performance.py expects
+        df = df.rename(columns={
+            "pnl_pct": "realized_pnl",
+            "holding_minutes": "holding_period_min",
+            "direction": "signal_direction",
+            "ticker": "signal_ticker",
+            "entry_time": "created_at",
+        })
+        return compute_metrics(df)
+
+    def print_performance(self, results: BacktestResults) -> None:
+        """Print full performance report to stdout."""
+        m = self.performance(results)
+        print_report(m)
+
+    def optimize(
+        self,
+        results: BacktestResults,
+        optimize_sl: bool = True,
+        optimize_conf: bool = True,
+        optimize_kelly: bool = True,
+    ) -> dict:
+        """Run all optimisers and return results dict."""
+        df = results.to_dataframe()
+        if df.empty:
+            return {}
+
+        df = df.rename(columns={
+            "pnl_pct": "realized_pnl",
+            "holding_minutes": "holding_period_min",
+            "direction": "signal_direction",
+            "ticker": "signal_ticker",
+            "entry_time": "created_at",
+        })
+
+        m = compute_metrics(df)
+        out = {"metrics": m}
+
+        if optimize_sl:
+            out["stop_loss_sweep"] = optimize_stop_loss(df)
+            best_sl = out["stop_loss_sweep"].iloc[0]["stop_loss_pct"]
+            logger.info("Best stop-loss by Sharpe: %.1f%%", best_sl * 100)
+
+        if optimize_conf and "confidence" in df.columns:
+            out["confidence_sweep"] = optimize_confidence(df)
+            best_conf = out["confidence_sweep"].iloc[0]["min_confidence"]
+            logger.info("Best min-confidence by Sharpe: %.2f", best_conf)
+
+        if optimize_kelly:
+            out["bet_size_sweep"] = optimize_bet_size(df, m.kelly_f)
+            logger.info(
+                "Kelly f*=%.1f%%  Half-Kelly=%.1f%%",
+                m.kelly_f * 100, m.half_kelly_f * 100,
+            )
+
+        return out
 
     def save_results(self, results: BacktestResults, out_path: Optional[str] = None) -> str:
         """Save trade-level results to CSV. Returns the output path."""
