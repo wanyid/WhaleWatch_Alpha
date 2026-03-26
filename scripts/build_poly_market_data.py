@@ -68,6 +68,10 @@ DEAD_ZONE_PCT: dict[str, float] = {
 
 ROLLING_BASELINE_WINDOW = 20   # sessions for excess-return baseline
 
+# Fade model: initial-move window used as entry lag
+FADE_ENTRY_LAG  = "30m"                      # observe first 30m, then enter opposite
+FADE_PERIODS    = ["2h", "4h", "1d"]         # continuation periods to label
+
 # Volume spike detection
 VOLUME_ROLLING_WINDOW   = 20   # hours for rolling volume baseline
 VOLUME_SPIKE_THRESHOLD  = 50.0 # % above rolling avg = volume spike
@@ -448,6 +452,56 @@ def add_excess_labels(sessions: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Step 6 — Fade labels (continuation return after initial move)
+# ---------------------------------------------------------------------------
+
+def add_fade_labels(sessions: pd.DataFrame) -> pd.DataFrame:
+    """Compute continuation returns and fade direction labels.
+
+    After the standard session entry (T+60min), the model waits FADE_ENTRY_LAG
+    (30m) to observe the initial market reaction, then enters in the OPPOSITE
+    direction.
+
+    Columns added:
+      initial_ret          : SPY return during the entry-lag window (= ret_30m)
+      initial_direction    : +1 if initial move up, -1 if down
+      abs_initial_ret      : absolute magnitude of the initial move
+
+      ret_cont_{period}    : SPY return from T+90min onward
+                             = ret_{period} - ret_30m
+      fade_label_{period}  : 1 if continuation reverses the initial direction
+                             (the fade worked), 0 if it continued, NaN if data
+                             unavailable
+    """
+    initial_col = f"ret_{FADE_ENTRY_LAG}"
+    if initial_col not in sessions.columns:
+        logger.warning("add_fade_labels: %s column missing — skipping", initial_col)
+        return sessions
+
+    sessions["initial_ret"]       = sessions[initial_col]
+    sessions["initial_direction"] = np.sign(sessions[initial_col])
+    sessions["abs_initial_ret"]   = sessions[initial_col].abs()
+
+    for period_name in FADE_PERIODS:
+        total_col = f"ret_{period_name}"
+        cont_col  = f"ret_cont_{period_name}"
+        lbl_col   = f"fade_label_{period_name}"
+
+        if total_col not in sessions.columns:
+            continue
+
+        # Continuation = total return (from T+60min) minus the initial move
+        sessions[cont_col] = sessions[total_col] - sessions[initial_col]
+
+        # Fade worked if continuation is opposite sign to initial move
+        both_valid = sessions[cont_col].notna() & sessions[initial_col].notna()
+        fade_worked = (sessions[cont_col] * sessions[initial_col]) < 0
+        sessions[lbl_col] = np.where(both_valid, fade_worked.astype(int), np.nan)
+
+    return sessions
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -518,8 +572,11 @@ def run(session_window_min: int, price_delta: float) -> None:
     logger.info("Computing SPY forward returns (entry at T+%dmin)...", session_window_min)
     sessions = compute_spy_returns(sessions, spy_5m, spy_1h, session_window_min)
 
-    # Excess return labels
+    # Directional labels (raw return)
     sessions = add_excess_labels(sessions)
+
+    # Fade labels (continuation return after initial move)
+    sessions = add_fade_labels(sessions)
 
     # Drop rows with no SPY price data at all
     ret_cols = [f"ret_{p}" for p in HOLDING_PERIODS]
@@ -528,8 +585,8 @@ def run(session_window_min: int, price_delta: float) -> None:
     sessions.to_parquet(OUT_PATH)
     logger.info("Saved %d sessions → %s", len(sessions), OUT_PATH)
 
-    # Summary
-    logger.info("\n--- Label summary ---")
+    # Summary — directional labels
+    logger.info("\n--- Directional label summary ---")
     for period_name in HOLDING_PERIODS:
         lbl_col = f"label_{period_name}"
         if lbl_col not in sessions.columns:
@@ -543,7 +600,24 @@ def run(session_window_min: int, price_delta: float) -> None:
         else:
             logger.info("  %-4s  n=0  (no valid labels)", period_name)
 
+    # Summary — fade labels
+    logger.info("\n--- Fade label summary (entry lag: %s) ---", FADE_ENTRY_LAG)
+    for period_name in FADE_PERIODS:
+        lbl_col = f"fade_label_{period_name}"
+        if lbl_col not in sessions.columns:
+            continue
+        valid = sessions[lbl_col].dropna()
+        if len(valid) > 0:
+            logger.info(
+                "  %-4s  n=%4d  fade_rate=%.1f%%  (initial_ret mean=%.3f%%)",
+                period_name, len(valid), valid.mean() * 100,
+                sessions["initial_ret"].dropna().mean() * 100,
+            )
+        else:
+            logger.info("  %-4s  n=0  (no valid fade labels)", period_name)
+
     logger.info("\nNext: python scripts/train_poly_model.py")
+    logger.info("      python scripts/train_poly_fade_model.py")
 
 
 if __name__ == "__main__":
