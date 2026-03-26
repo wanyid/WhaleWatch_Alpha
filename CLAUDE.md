@@ -224,6 +224,7 @@ config: add data_start_date and LLM provider settings to settings.yaml
 - Use feature branches (`feat/reasoner-layer1`) for larger multi-session work if needed
 
 ### What NOT to commit
-- `.env` (secrets) — `.env.example` only
+- **`.env` and `.env.example` — NEVER commit either file. Both are gitignored.**
+  `.env.example` may contain real credentials and must never reach GitHub.
 - `data/`, `*.db`, `*.sqlite` — local artifacts
 - `__pycache__/`, `.claude/` — see `.gitignore`

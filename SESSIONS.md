@@ -224,3 +224,4 @@ python scripts/pull_historical_data.py
 - **Polymarket data depth**: CLOB `/prices-history` with `fidelity=1440` returns data only from market creation date (not from 2024-01-01 for newer markets). This is expected — prices don't exist before a market opens.
 - **VIX 5m data**: yfinance returns ~2× more rows than SPY/QQQ for the same period (8,887 vs ~4,557) — likely because VIX trades extended hours. Filter to market hours if needed for signal alignment.
 - **Truth Social rate limiting**: Cloudflare blocks after ~40 rapid requests. Script pauses 25s every 40 posts automatically. Needs credentials in `.env`.
+- **SECRETS — NEVER PUSH TO GITHUB**: `.env` AND `.env.example` are both gitignored and must never be committed. `.env.example` may contain real credentials. Both files are blocked in `.gitignore`.
