@@ -6,9 +6,9 @@ small to plausibly be post-driven.
 
 For each holding period (5m, 30m, 1h, 2h, 4h, 1d):
   - rolling_mean = 20-post trailing average of spy_ret_X (shift-1, no lookahead)
-  - excess_return = spy_ret_X - rolling_mean
-  - Label: 1 (BUY) if excess_return > +threshold, 0 (SHORT) if < -threshold
-  - Rows in the dead zone (|excess_return| <= threshold) are dropped
+  - Label: 1 (BUY) if spy_ret_X > +threshold, 0 (SHORT) if spy_ret_X < -threshold
+  - Rows in the dead zone (|spy_ret_X| <= threshold) are dropped
+  - excess_return columns are computed and stored for reference but not used for labels
   - Train XGBoost binary classifier with isotonic calibration
   - TimeSeriesSplit CV to avoid lookahead bias
   - Report AUC, Brier score, calibration table, feature importance
@@ -172,23 +172,29 @@ def _build_label(
     period: str,
     ret_col: str,
 ) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
-    """Return (X, y, df_valid) after applying excess-return labeling + dead-zone filter.
+    """Return (X, y, df_valid) after applying raw-return labeling + dead-zone filter.
 
-    y = 1 (BUY)   if excess_ret > +threshold
-    y = 0 (SHORT) if excess_ret < -threshold
-    rows with |excess_ret| <= threshold are dropped (dead zone)
+    Labels are based on the sign of the RAW SPY return, not the excess return.
+    Using raw returns avoids the rolling-baseline absorption problem: when
+    posts cluster in time, the rolling mean partially cancels the signal it is
+    meant to isolate.
+
+    y = 1 (BUY)   if raw_ret > +threshold
+    y = 0 (SHORT) if raw_ret < -threshold
+    rows with |raw_ret| <= threshold are dropped (dead zone)
+
+    The excess_ret columns computed by _compute_excess_returns are kept in
+    the DataFrame for exploratory analysis but are not used here.
     """
-    excess_col = f"excess_{ret_col}"
-    threshold  = DEAD_ZONE[period]
+    threshold = DEAD_ZONE[period]
 
-    if excess_col not in df.columns:
-        raise ValueError(f"excess column {excess_col} not found — call _compute_excess_returns first")
+    if ret_col not in df.columns:
+        raise ValueError(f"return column {ret_col} not found in DataFrame")
 
-    # Drop rows where excess return is NaN (rolling window not yet full) or in dead zone
-    mask_valid   = df[excess_col].notna()
-    mask_buy     = df[excess_col] > +threshold
-    mask_short   = df[excess_col] < -threshold
-    mask_signal  = mask_valid & (mask_buy | mask_short)
+    mask_valid  = df[ret_col].notna()
+    mask_buy    = df[ret_col] > +threshold
+    mask_short  = df[ret_col] < -threshold
+    mask_signal = mask_valid & (mask_buy | mask_short)
 
     df_valid = df[mask_signal].copy()
 
@@ -378,7 +384,7 @@ def _save_model(
         "features":       ALL_FEATURES,
         "period":         period,
         "ret_col":        ret_col,
-        "label_method":   "excess_return",
+        "label_method":   "raw_return",
         "rolling_window": rolling_window,
         "dead_zone_pct":  DEAD_ZONE[period] * 100,
         "n_train":        n,

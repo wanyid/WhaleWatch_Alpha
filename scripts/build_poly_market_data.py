@@ -361,15 +361,28 @@ def compute_spy_returns(
     sessions: pd.DataFrame,
     spy_5m: pd.DataFrame,
     spy_1h: pd.DataFrame,
+    session_window_min: int = DEFAULT_SESSION_WINDOW,
 ) -> pd.DataFrame:
-    """Add raw SPY forward return columns for each holding period."""
+    """Add raw SPY forward return columns for each holding period.
+
+    Entry is anchored at T + session_window_min (i.e., after the session
+    window has closed), not at T+0 (first anomaly).
+
+    Rationale: session features (n_events, corroboration_ratio, etc.) are
+    computed across the full session window. At T+0 only the first anomaly is
+    known; the complete feature vector isn't available until T+60min. Using
+    T+60min as the entry ensures the model is predicting using only information
+    that would be available at inference time.
+    """
     for period_name, minutes in HOLDING_PERIODS.items():
-        spy       = spy_5m if minutes <= 60 else spy_1h
-        ret_col   = f"ret_{period_name}"
-        returns   = []
+        spy     = spy_5m if minutes <= 60 else spy_1h
+        ret_col = f"ret_{period_name}"
+        returns = []
 
         for ts in sessions["session_time"]:
-            entry_bar = _next_bar(ts, spy)
+            # Wait for the session window to close before entering
+            entry_ts  = ts + pd.Timedelta(minutes=session_window_min)
+            entry_bar = _next_bar(entry_ts, spy)
             if entry_bar is None or entry_bar < spy.index[0]:
                 returns.append(None)
                 continue
@@ -394,18 +407,21 @@ def compute_spy_returns(
 # ---------------------------------------------------------------------------
 
 def add_excess_labels(sessions: pd.DataFrame) -> pd.DataFrame:
-    """Convert raw SPY returns to excess returns; add binary direction labels.
+    """Compute rolling excess returns and raw-return direction labels.
 
-    Excess return = actual return − rolling 20-session mean (removes SPY drift).
-    shift(1) ensures each session's baseline uses only prior sessions — no
-    lookahead.
+    Two things happen here:
+      1. excess_ret_* columns are computed and stored for exploration and the
+         fade model (not used to define training labels).
+      2. label_* = sign of the RAW return (1 = SPY up, 0 = SPY down).
 
-    NOTE: dead-zone filtering is intentionally NOT applied here. The dead zone
-    is applied at training time (train_poly_model.py) so that:
-      - Different thresholds can be tested without rebuilding the dataset
-      - The fade model can use a different (stricter) overshoot threshold
-      - The raw excess_ret_* columns remain available for continuation-return
-        computation in the fade pipeline
+    Using raw returns for labels avoids the rolling-baseline absorption
+    problem: if signals cluster in time the rolling mean partially cancels the
+    very signal it should be measuring.  The dead zone (filter on |raw_ret|)
+    is applied at training time so thresholds can be changed without a rebuild.
+
+    Rolling baseline notes:
+      - shift(1) ensures no lookahead: row i's baseline uses sessions 0..i-1
+      - excess_ret_* are informational; they are NOT in the model feature set
     """
     for period_name in HOLDING_PERIODS:
         ret_col   = f"ret_{period_name}"
@@ -415,16 +431,16 @@ def add_excess_labels(sessions: pd.DataFrame) -> pd.DataFrame:
         if ret_col not in sessions.columns:
             continue
 
-        # shift(1): row i's baseline uses sessions 0..i-1 only
+        # Excess return stored for reference / fade model (shift(1) = no lookahead)
         baseline         = sessions[ret_col].shift(1).rolling(
             ROLLING_BASELINE_WINDOW, min_periods=5
         ).mean()
         sessions[ex_col] = sessions[ret_col] - baseline
 
-        # Label = sign of excess return; NaN only where excess_ret is NaN
+        # Label = sign of raw return; NaN only where ret is NaN
         sessions[lbl_col] = np.where(
-            sessions[ex_col].notna(),
-            (sessions[ex_col] > 0).astype(int),
+            sessions[ret_col].notna(),
+            (sessions[ret_col] > 0).astype(int),
             np.nan,
         )
 
@@ -498,9 +514,9 @@ def run(session_window_min: int, price_delta: float) -> None:
     sessions = add_temporal_features(sessions)
     sessions = add_vix_features(sessions, vix_close, vix_pct, vixy_5m)
 
-    # SPY returns
-    logger.info("Computing SPY forward returns...")
-    sessions = compute_spy_returns(sessions, spy_5m, spy_1h)
+    # SPY returns (entry anchored at T + session_window_min)
+    logger.info("Computing SPY forward returns (entry at T+%dmin)...", session_window_min)
+    sessions = compute_spy_returns(sessions, spy_5m, spy_1h, session_window_min)
 
     # Excess return labels
     sessions = add_excess_labels(sessions)

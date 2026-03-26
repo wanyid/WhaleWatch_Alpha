@@ -47,6 +47,10 @@ DEFAULT_START   = "2024-01-01"
 DEFAULT_MIN_VOL = 50_000     # USD total volume — filters out thin markets
 CALL_SLEEP_SEC  = 0.5        # generous; Polymarket has no stated rate limit
 
+# Polymarket CLOB prices-history silently caps responses to ~28 days of bars
+# regardless of start_ts when fidelity=60. Chunked requests work around this.
+CHUNK_DAYS = 25              # request window size — kept under the 28-day cap
+
 # ---------------------------------------------------------------------------
 # Topic bucket classification
 # ---------------------------------------------------------------------------
@@ -175,7 +179,7 @@ def fetch_price_history(
     end_ts: int,
     fidelity: int = 60,   # minutes per bucket (1 | 60 | 1440)
 ) -> pd.DataFrame:
-    """Fetch YES hourly price history from CLOB prices-history endpoint."""
+    """Fetch YES price history for a single time window from CLOB prices-history."""
     try:
         resp = _session.get(
             f"{CLOB_BASE}/prices-history",
@@ -202,11 +206,45 @@ def fetch_price_history(
         return pd.DataFrame()
 
 
+def fetch_price_history_chunked(
+    token_id: str,
+    start_ts: int,
+    end_ts: int,
+    fidelity: int = 60,
+    chunk_days: int = CHUNK_DAYS,
+) -> pd.DataFrame:
+    """Fetch full history by issuing multiple requests in chunk_days windows.
+
+    The CLOB prices-history endpoint silently caps responses to ~28 days of
+    hourly bars regardless of the requested start_ts. Chunking works around
+    this: we slide a window from start_ts to end_ts in chunk_days increments
+    and stitch the results together.
+    """
+    chunk_secs = chunk_days * 24 * 3600
+    all_dfs: list[pd.DataFrame] = []
+    t = start_ts
+
+    while t < end_ts:
+        t_end = min(t + chunk_secs, end_ts)
+        chunk = fetch_price_history(token_id, t, t_end, fidelity=fidelity)
+        if not chunk.empty:
+            all_dfs.append(chunk)
+        t = t_end
+        time.sleep(CALL_SLEEP_SEC)
+
+    if not all_dfs:
+        return pd.DataFrame()
+
+    combined = pd.concat(all_dfs).sort_index()
+    combined = combined[~combined.index.duplicated(keep="last")]
+    return combined
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def run(start: str, min_volume: float, force_full: bool) -> None:
+def run(start: str, min_volume: float, force_full: bool, fidelity: int = 60) -> None:
     PRICES_DIR.mkdir(parents=True, exist_ok=True)
 
     start_ts = int(datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
@@ -267,8 +305,13 @@ def run(start: str, min_volume: float, force_full: bool) -> None:
             except Exception:
                 existing = pd.DataFrame()
 
-        new_df = fetch_price_history(row["yes_token_id"], fetch_start, end_ts, fidelity=60)
-        time.sleep(CALL_SLEEP_SEC)
+        # Chunked fetch: slides CHUNK_DAYS windows across the full date range.
+        # A single fidelity=60 request is silently capped at ~28 days by the API.
+        new_df = fetch_price_history_chunked(
+            row["yes_token_id"], fetch_start, end_ts,
+            fidelity=fidelity, chunk_days=CHUNK_DAYS,
+        )
+        # Sleep already included inside fetch_price_history_chunked per chunk.
 
         if new_df.empty:
             n_fail += 1
@@ -290,7 +333,7 @@ def run(start: str, min_volume: float, force_full: bool) -> None:
             )
 
     logger.info("Done.  Pulled: %d  Skipped (up to date): %d  Failed: %d", n_ok, n_skip, n_fail)
-    logger.info("Price files → %s", PRICES_DIR)
+    logger.info("Price files → %s  (fidelity=%dm)", PRICES_DIR, fidelity)
     logger.info("Next: python scripts/build_poly_market_data.py")
 
 
@@ -302,5 +345,8 @@ if __name__ == "__main__":
                         help="Minimum total USD volume to include a market (default: 50000)")
     parser.add_argument("--force-full", action="store_true",
                         help="Re-fetch all history even if local file exists")
+    parser.add_argument("--fidelity", type=int, default=60,
+                        help="Bar size in minutes: 60=hourly (default), 1440=daily")
     args = parser.parse_args()
-    run(start=args.start, min_volume=args.min_volume, force_full=args.force_full)
+    run(start=args.start, min_volume=args.min_volume,
+        force_full=args.force_full, fidelity=args.fidelity)

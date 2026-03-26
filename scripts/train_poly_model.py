@@ -280,19 +280,18 @@ def train_period(
         logger.warning("  %s: label column missing — skipping", period)
         return
 
-    # Apply dead-zone filter: drop rows where |excess_ret| is below threshold.
-    # This was previously done at build time; moving it here lets us vary the
-    # threshold without rebuilding the dataset and keeps raw labels available
-    # for the fade model pipeline.
+    # Apply dead-zone filter on the raw return: drop rows where |ret| is below
+    # the threshold. Labels are based on sign(raw_ret), so this removes rows
+    # where the move is too small to be a meaningful directional signal.
     dead_zone = DEAD_ZONE.get(period, 0.0)
-    if exc_col in df_train.columns:
+    if ret_col in df_train.columns:
         mask_valid = (
             df_train[lbl_col].notna() &
-            (df_train[exc_col].abs() >= dead_zone)
+            (df_train[ret_col].abs() >= dead_zone)
         )
     else:
         mask_valid = df_train[lbl_col].notna()
-        logger.warning("  %s: excess_ret column missing — dead zone not applied", period)
+        logger.warning("  %s: ret column missing — dead zone not applied", period)
 
     df_valid = df_train[mask_valid].copy()
     df_valid[lbl_col] = df_valid[lbl_col].astype(int)
@@ -358,7 +357,7 @@ def train_period(
     oos_m = _oos_metrics_poly(model, X_oos_p, y_oos_p) if len(X_oos_p) > 0 else {}
     _save_model(
         model, features, period, cv, len(y), pos_rate, ret_col,
-        label_method="excess_return_rolling20", suffix="",
+        label_method="raw_return", suffix="",
         extra_meta={"train_cutoff": str(TRAIN_CUTOFF.date()), "oos_metrics": oos_m},
     )
     if oos_m:
@@ -391,7 +390,7 @@ def train_period(
                     oos_r   = _oos_metrics_poly(model_r, X_oos_r, y_oos_r)
             _save_model(
                 model_r, features, period, cv_r, len(y_r), float(y_r.mean()),
-                ret_col, label_method="excess_return_rolling20",
+                ret_col, label_method="raw_return",
                 suffix=f"_{regime_name}",
                 extra_meta={"vix_threshold": vix_threshold, "regime": regime_name,
                             "train_cutoff": str(TRAIN_CUTOFF.date()), "oos_metrics": oos_r},
@@ -405,7 +404,7 @@ def train_period(
         oos_w   = _oos_metrics_poly(model_w, X_oos_p, y_oos_p) if len(X_oos_p) > 0 else {}
         _save_model(
             model_w, features, period, cv_w, len(y), pos_rate,
-            ret_col, label_method="excess_return_rolling20",
+            ret_col, label_method="raw_return",
             suffix="_weighted",
             extra_meta={"decay_half_life_days": decay_half,
                         "train_cutoff": str(TRAIN_CUTOFF.date()), "oos_metrics": oos_w},
