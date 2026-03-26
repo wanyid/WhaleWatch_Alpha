@@ -1,0 +1,46 @@
+# WhaleWatch_Alpha configuration
+
+data:
+  # Training data window — do not use data before this date
+  data_start_date: "2025-01-20"
+  # Market data provider: "yfinance" (free) | "polygon" (future)
+  market_data_provider: "yfinance"
+
+scanners:
+  truth_social:
+    username: "realDonaldTrump"
+    poll_interval_seconds: 60       # Stay under Cloudflare rate limits
+    include_reposts: false
+
+  polymarket:
+    poll_interval_seconds: 30
+    # Minimum volume spike % above 7-day rolling average to trigger signal
+    volume_spike_threshold_pct: 50.0
+    # Minimum absolute price delta to trigger signal
+    min_price_delta: 0.05
+
+reasoner:
+  layer1:
+    # LLM provider: "claude" | "openai"
+    provider: "claude"
+    model: "claude-opus-4-6"
+    temperature: 0.0                # Deterministic signal generation
+
+  layer2:
+    # Predictor: "logistic" | "neural_network"
+    predictor: "logistic"
+    # Min confidence (win rate) to forward to executor
+    min_confidence: 0.60
+    # Holding period bounds (minutes)
+    min_holding_minutes: 1
+    max_holding_minutes: 4320       # 3 days
+
+tickers:
+  - "SPY"
+  - "QQQ"
+  - "VIX"
+
+risk:
+  stop_loss_pct: 0.02               # 2% hard stop
+  take_profit_pct: 0.04             # 4% take profit (2:1 R/R)
+  daily_drawdown_halt_pct: 0.03     # Halt new signals if daily P&L < -3%

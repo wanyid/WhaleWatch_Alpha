@@ -1,0 +1,24 @@
+# Data collection
+truthbrush>=0.1.0
+yfinance>=0.2.0
+py-clob-client>=0.34.0
+requests>=2.31.0
+
+# LLM providers
+anthropic>=0.40.0
+openai>=1.0.0
+
+# ML / Stats
+scikit-learn>=1.4.0
+numpy>=1.26.0
+pandas>=2.2.0
+
+# Config & utilities
+pyyaml>=6.0
+python-dotenv>=1.0.0
+
+# Storage
+sqlalchemy>=2.0.0
+
+# Testing
+pytest>=8.0.0
