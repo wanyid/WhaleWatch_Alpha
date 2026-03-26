@@ -1,18 +1,31 @@
 """One-time historical data pull — no API key required.
 
 Downloads and stores:
-  1. SPY / QQQ / VIX  — 5-minute OHLCV since 2024-01-01 via yfinance
-                         (chunked in 50-day windows; free, no signup needed)
+  1. SPY / QQQ / VIX  — daily OHLCV since 2024-01-01 via yfinance (unlimited lookback)
+                       + last 60 days of 5-minute bars via yfinance (intraday detail)
   2. Polymarket        — hourly price history for all politically-relevant
                          markets (including closed) via CLOB + Gamma APIs
   3. Truth Social      — all @realDonaldTrump posts since 2024-01-01
                          via truthbrush (requires Truth Social credentials)
 
+yfinance resolution limits (hard Yahoo Finance API restrictions):
+  1m  → last 7 days only
+  5m  → last 60 days only
+  1h  → last 730 days only  (but 2024-01-01 is ~815 days ago — too far)
+  1d  → unlimited ✓
+
+Strategy: store daily bars for full history (backtesting) + 5m bars for the
+last 60 days (intraday signal validation). For true 1-minute history back to
+2024, upgrade to Polygon.io free tier via the existing base_provider interface.
+
 Output directory: D:/WhaleWatch_Data/
   equity/
-    SPY_5m.parquet         (~1.5M rows, ~80 MB)
-    QQQ_5m.parquet
-    VIX_5m.parquet
+    SPY_1d.parquet       (daily, 2024-01-01 → today)
+    QQQ_1d.parquet
+    VIX_1d.parquet
+    SPY_5m_recent.parquet   (5-minute, last 60 days)
+    QQQ_5m_recent.parquet
+    VIX_5m_recent.parquet
   polymarket/
     markets_catalog.parquet
     prices/{condition_id}_YES.parquet
@@ -94,33 +107,55 @@ TRUTH_SOCIAL_USER = "realDonaldTrump"
 # ===========================================================================
 
 def pull_equity() -> None:
-    """Download 5-minute OHLCV for SPY, QQQ, VIX via yfinance (chunked)."""
-    from scanners.market_data.yfinance_provider import YFinanceProvider
+    """Download equity data for SPY, QQQ, VIX via yfinance.
+
+    Two passes per ticker:
+      - Daily bars from DATA_START → today (unlimited yfinance lookback)
+      - 5-minute bars for last 60 days (finest intraday resolution available free)
+    """
+    import yfinance as yf
 
     EQUITY_DIR.mkdir(parents=True, exist_ok=True)
-    provider = YFinanceProvider()
     today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
 
     for ticker in TICKERS:
-        out_path = EQUITY_DIR / f"{ticker}_5m.parquet"
-        logger.info("--- %s ---", ticker)
+        yf_ticker = f"^{ticker}" if ticker == "VIX" else ticker
+
+        # --- Daily bars: full history ---
+        out_daily = EQUITY_DIR / f"{ticker}_1d.parquet"
+        logger.info("--- %s daily ---", ticker)
         try:
-            df = provider.get_ohlcv_chunked(
-                ticker,
-                start=DATA_START,
-                end=today,
-                interval="5m",
-            )
+            df = yf.download(yf_ticker, start=DATA_START, end=today,
+                             interval="1d", auto_adjust=True, progress=False)
             if df.empty:
-                logger.warning("No data returned for %s — skipping.", ticker)
-                continue
-
-            df.to_parquet(out_path)
-            size_mb = out_path.stat().st_size / 1e6
-            logger.info("Saved %s → %s  (%s rows, %.1f MB)", ticker, out_path.name, f"{len(df):,}", size_mb)
-
+                logger.warning("No daily data for %s.", ticker)
+            else:
+                df.columns = [c.lower() if isinstance(c, str) else c[0].lower() for c in df.columns]
+                df.index = pd.to_datetime(df.index, utc=True)
+                df = df[["open", "high", "low", "close", "volume"]].dropna()
+                df.to_parquet(out_daily)
+                logger.info("Saved %s daily → %s rows, %.1f MB",
+                            ticker, len(df), out_daily.stat().st_size / 1e6)
         except Exception as exc:
-            logger.error("Failed to pull %s: %s", ticker, exc)
+            logger.error("Daily pull failed for %s: %s", ticker, exc)
+
+        # --- 5-minute bars: last 60 days ---
+        out_5m = EQUITY_DIR / f"{ticker}_5m_recent.parquet"
+        logger.info("--- %s 5m (last 60 days) ---", ticker)
+        try:
+            df5 = yf.download(yf_ticker, period="60d",
+                              interval="5m", auto_adjust=True, progress=False)
+            if df5.empty:
+                logger.warning("No 5m data for %s.", ticker)
+            else:
+                df5.columns = [c.lower() if isinstance(c, str) else c[0].lower() for c in df5.columns]
+                df5.index = pd.to_datetime(df5.index, utc=True)
+                df5 = df5[["open", "high", "low", "close", "volume"]].dropna()
+                df5.to_parquet(out_5m)
+                logger.info("Saved %s 5m → %s rows, %.1f MB",
+                            ticker, len(df5), out_5m.stat().st_size / 1e6)
+        except Exception as exc:
+            logger.error("5m pull failed for %s: %s", ticker, exc)
 
 
 # ===========================================================================
@@ -133,11 +168,20 @@ def _is_relevant(question: str) -> bool:
 
 
 def _extract_yes_token_id(market: dict) -> str | None:
-    for token in market.get("tokens", []):
-        if str(token.get("outcome", "")).upper() == "YES":
-            return str(token.get("token_id", ""))
-    ids = market.get("clobTokenIds", [])
-    return str(ids[0]) if ids else None
+    """Extract YES token ID from Gamma API market dict.
+
+    Gamma returns clobTokenIds as a JSON string e.g. '["123...", "456..."]'
+    where index 0 = YES token, index 1 = NO token (matches outcomes order).
+    """
+    clob_ids_raw = market.get("clobTokenIds", "")
+    if clob_ids_raw:
+        try:
+            ids = json.loads(clob_ids_raw) if isinstance(clob_ids_raw, str) else clob_ids_raw
+            if ids:
+                return str(ids[0])
+        except (json.JSONDecodeError, IndexError):
+            pass
+    return None
 
 
 def discover_polymarket_markets(session: requests.Session) -> list[dict]:
@@ -184,7 +228,7 @@ def pull_polymarket_prices(session: requests.Session, markets: list[dict]) -> No
     end_ts = int(datetime.now(tz=timezone.utc).timestamp())
 
     for i, market in enumerate(markets, 1):
-        cid = market.get("condition_id", "")
+        cid = market.get("conditionId", "")
         question = market.get("question", "")[:60]
         yes_token = _extract_yes_token_id(market)
 
@@ -201,11 +245,11 @@ def pull_polymarket_prices(session: requests.Session, markets: list[dict]) -> No
             resp = session.get(
                 f"{CLOB_BASE}/prices-history",
                 params={
-                    "token_id": yes_token,
+                    "market": yes_token,
                     "interval": "max",
-                    "fidelity": 60,
-                    "start_time": start_ts,
-                    "end_time": end_ts,
+                    "fidelity": 1440,   # daily — hourly (60) only returns ~28 days
+                    "start_ts": start_ts,
+                    "end_ts": end_ts,
                 },
                 timeout=20,
             )
@@ -237,11 +281,12 @@ def pull_polymarket() -> None:
 
     POLY_DIR.mkdir(parents=True, exist_ok=True)
     catalog = pd.DataFrame([{
-        "condition_id": m.get("condition_id", ""),
+        "condition_id": m.get("conditionId", ""),
         "question":     m.get("question", ""),
-        "slug":         m.get("market_slug", ""),
+        "slug":         m.get("slug", ""),
         "closed":       m.get("closed", False),
-        "end_date":     m.get("end_date_iso", ""),
+        "end_date":     m.get("endDateIso", m.get("endDate", "")),
+        "volume_24h":   m.get("volume24hr", 0),
         "yes_token_id": _extract_yes_token_id(m) or "",
     } for m in markets])
     catalog_path = POLY_DIR / "markets_catalog.parquet"
@@ -325,8 +370,7 @@ def main() -> None:
     logger.info("Start  : %s", DATA_START)
     logger.info("=" * 60)
     logger.info("")
-    logger.info("Equity: yfinance 5-minute bars (chunked, no API key needed)")
-    logger.info("Expect ~5-15 min per ticker for 2024-present history.")
+    logger.info("Equity: daily bars (full 2024-present) + 5m bars (last 60 days) via yfinance")
     logger.info("")
 
     logger.info("[1/3] Equity (SPY 5m / QQQ 5m / VIX 5m)...")
