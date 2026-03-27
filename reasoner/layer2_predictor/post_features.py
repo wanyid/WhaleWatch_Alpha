@@ -23,9 +23,10 @@ KEYWORD_FEATURES = [
 ]
 
 POST_FEATURES = [
-    "favourites_count",
-    "reblogs_count",
-    "engagement",
+    # engagement counts (favourites_count, reblogs_count, engagement) are excluded:
+    # historical parquet records accumulated counts at scrape time, not at T=0,
+    # making them lookahead features in training.  caps_ratio, content_length,
+    # and keyword_count are derivable from post content alone.
     "caps_ratio",
     "content_length",
     "keyword_count",
@@ -44,7 +45,7 @@ MARKET_FEATURES = [
     "vixy_level",
 ]
 
-# Canonical order for directional model (20 features total)
+# Canonical order for directional model (17 features total)
 ALL_DIRECTIONAL_FEATURES = (
     KEYWORD_FEATURES
     + POST_FEATURES
@@ -64,5 +65,5 @@ FADE_FEATURES = [
     "spy_abs_initial_ret",    # magnitude alone; larger overshoot = stronger candidate
 ]
 
-# Full feature set for fade model (23 features total)
+# Full feature set for fade model (20 features total)
 ALL_FADE_FEATURES = ALL_DIRECTIONAL_FEATURES + FADE_FEATURES

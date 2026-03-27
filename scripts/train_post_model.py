@@ -594,12 +594,20 @@ def run(
         print(summary_df.to_string(index=False))
         print()
 
-        if "auc_roc" in summary_df.columns and not summary_df["auc_roc"].isna().all():
+        if "brier_score" in summary_df.columns and not summary_df["brier_score"].isna().all():
+            # Select by Brier score (lower = better calibration) — this is the right
+            # criterion when confidence is used as a threshold at inference time.
+            best = summary_df.loc[summary_df["brier_score"].idxmin()]
+            logger.info(
+                "Best period (by Brier): %s  Brier=%.4f  AUC=%.4f  n_train=%d (%.0f%% of data kept)",
+                best["period"], best["brier_score"], best.get("auc_roc", float("nan")),
+                best["n_train"], best["pct_kept"],
+            )
+        elif "auc_roc" in summary_df.columns and not summary_df["auc_roc"].isna().all():
             best = summary_df.loc[summary_df["auc_roc"].idxmax()]
             logger.info(
-                "Best period: %s  AUC=%.4f  accuracy=%.4f  n_train=%d (%.0f%% of data kept)",
-                best["period"], best["auc_roc"], best.get("accuracy", float("nan")),
-                best["n_train"], best["pct_kept"],
+                "Best period (by AUC fallback): %s  AUC=%.4f  n_train=%d",
+                best["period"], best["auc_roc"], best["n_train"],
             )
 
 

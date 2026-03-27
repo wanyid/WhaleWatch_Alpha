@@ -47,11 +47,11 @@ MODELS_DIR = Path(__file__).resolve().parent.parent / "models" / "saved"
 
 class TestPostFeatures:
     def test_directional_total(self):
-        assert len(POST_DIR_FEATURES) == 20
+        assert len(POST_DIR_FEATURES) == 17
 
     def test_directional_groups(self):
         assert len(KEYWORD_FEATURES) == 7
-        assert len(POST_FEATURES) == 6
+        assert len(POST_FEATURES) == 3
         assert len(TEMPORAL_FEATURES) == 4
         assert len(MARKET_FEATURES) == 3
 
@@ -64,7 +64,7 @@ class TestPostFeatures:
         assert len(POST_DIR_FEATURES) == len(set(POST_DIR_FEATURES))
 
     def test_fade_total(self):
-        assert len(POST_FADE_FEATURES) == 23
+        assert len(POST_FADE_FEATURES) == 20
 
     def test_fade_is_directional_plus_fade(self):
         assert POST_FADE_FEATURES == POST_DIR_FEATURES + POST_FADE_ONLY
