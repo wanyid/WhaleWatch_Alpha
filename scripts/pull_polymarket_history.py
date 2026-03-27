@@ -19,6 +19,7 @@ Usage:
 
 import argparse
 import logging
+import json
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -160,13 +161,25 @@ def discover_markets(start_date: str, min_volume: float) -> list[dict]:
 
 
 def extract_yes_token(market: dict) -> str | None:
-    """Extract the YES outcome token_id from a market dict."""
+    """Extract the YES outcome token_id from a market dict.
+
+    The Gamma API returns clobTokenIds as a JSON string (e.g. '["id1","id2"]')
+    where index 0 is the YES token and index 1 is the NO token.
+    The older 'tokens' list shape is also handled as a fallback.
+    """
     for token in market.get("tokens", []):
         if str(token.get("outcome", "")).upper() == "YES":
             return str(token.get("token_id", ""))
-    # Fallback: some shapes use clobTokenIds list
-    clob_ids = market.get("clobTokenIds", [])
-    return str(clob_ids[0]) if clob_ids else None
+    # Primary path: clobTokenIds is a JSON-encoded string of [yes_id, no_id]
+    raw = market.get("clobTokenIds", "")
+    if raw:
+        try:
+            clob_ids = json.loads(raw) if isinstance(raw, str) else raw
+            if clob_ids:
+                return str(clob_ids[0])
+        except (json.JSONDecodeError, ValueError, IndexError):
+            pass
+    return None
 
 
 # ---------------------------------------------------------------------------
