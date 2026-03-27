@@ -68,18 +68,18 @@ risk:
   daily_drawdown_halt_pct: 0.03     # Halt new signals if daily P&L < -3%
 
 executor:
-  # "paper" = local SQLite simulation (default)
-  # "alpaca" = live/paper broker via Alpaca API (requires ALPACA_API_KEY + ALPACA_SECRET_KEY in .env)
+  # "paper"  = local SQLite simulation, no broker required (default)
+  # "alpaca" = live trading via Alpaca API (requires ALPACA_API_KEY + ALPACA_SECRET_KEY in .env)
+  #            Always run "paper" first to validate strategy before switching to "alpaca".
   provider: "paper"
   paper_db_path: "D:/WhaleWatch_Data/paper_trades.db"
 
   # Alpaca settings (only used when provider = "alpaca")
-  alpaca_paper: true                    # true = paper-trading endpoint; false = live money
   alpaca_db_path: "D:/WhaleWatch_Data/alpaca_trades.db"
   alpaca_notional_per_trade: 1000       # USD notional per signal (fractional shares supported)
   # VIX is not directly tradeable — map to a proxy ETF.
   # BUY VIX  → buy this ticker (vol long)
-  # SHORT VIX → short this ticker (requires margin on live account)
+  # SHORT VIX → short this ticker (requires margin)
   vix_proxy_ticker: "UVXY"
 
 # Fade model parameters (Option B)

@@ -416,7 +416,7 @@ def _build_executor(market_provider) -> BaseExecutor:
 
     if provider == "alpaca":
         from executor.alpaca_executor import AlpacaExecutor
-        logger.info("Executor: AlpacaExecutor")
+        logger.info("Executor: AlpacaExecutor (LIVE)")
         return AlpacaExecutor()
 
     logger.info("Executor: PaperExecutor")

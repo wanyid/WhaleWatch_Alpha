@@ -1,10 +1,10 @@
-"""AlpacaExecutor — live/paper broker integration via Alpaca Markets API.
+"""AlpacaExecutor — live broker integration via Alpaca Markets API.
+
+Use PaperExecutor for all simulation and strategy validation.
+Switch to this executor only when ready to trade with real money.
 
 Swap in by setting settings.yaml → executor.provider: "alpaca"
 and populating ALPACA_API_KEY + ALPACA_SECRET_KEY in .env.
-
-Paper vs live is controlled by settings.yaml → executor.alpaca_paper (default: true).
-Always run paper mode first and verify P&L against PaperExecutor before going live.
 
 Position tracking is mirrored to a local SQLite database so that holding-period
 timeouts, True News Stops, and session summaries work exactly like PaperExecutor.
@@ -14,7 +14,7 @@ VIX note:
   VIX is not directly tradeable on Alpaca. It is mapped to a proxy ETF configured
   in settings.yaml → executor.vix_proxy_ticker (default: UVXY).
   BUY VIX  → buy UVXY  (volatility long)
-  SHORT VIX → short UVXY (requires margin on a live account)
+  SHORT VIX → short UVXY (requires margin)
 
 Usage:
   # In .env:
@@ -24,7 +24,6 @@ Usage:
   # In settings.yaml:
   executor:
     provider: "alpaca"
-    alpaca_paper: true
     alpaca_notional_per_trade: 1000
     vix_proxy_ticker: "UVXY"
 """
@@ -120,20 +119,18 @@ class AlpacaExecutor(BaseExecutor):
             )
 
         cfg = _load_settings().get("executor", {})
-        paper_mode     = cfg.get("alpaca_paper", True)
-        self._notional = float(cfg.get("alpaca_notional_per_trade", 1000))
+        self._notional  = float(cfg.get("alpaca_notional_per_trade", 1000))
         self._vix_proxy = cfg.get("vix_proxy_ticker", "UVXY")
         self._db_path   = cfg.get("alpaca_db_path", _DEFAULT_DB)
 
-        self._client         = TradingClient(api_key, secret_key, paper=paper_mode)
-        self._OrderSide      = OrderSide
-        self._TimeInForce    = TimeInForce
-        self._QueryOrderStatus = QueryOrderStatus
+        self._client              = TradingClient(api_key, secret_key, paper=False)
+        self._OrderSide           = OrderSide
+        self._TimeInForce         = TimeInForce
+        self._QueryOrderStatus    = QueryOrderStatus
         self._MarketOrderRequest  = MarketOrderRequest
         self._GetOrdersRequest    = GetOrdersRequest
 
-        mode_label = "PAPER" if paper_mode else "LIVE"
-        logger.info("AlpacaExecutor initialised (%s mode, notional=$%.0f)", mode_label, self._notional)
+        logger.info("AlpacaExecutor initialised (LIVE, notional=$%.0f)", self._notional)
 
         self._init_db()
 
