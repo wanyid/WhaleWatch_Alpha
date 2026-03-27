@@ -44,5 +44,8 @@ logs/
 .DS_Store
 Thumbs.db
 
-# Claude Code internal
-.claude/
+# Claude Code internal (session state — not committed)
+# Use glob, not trailing slash, so that !skills/ exception works
+.claude/*
+!.claude/skills/
+!.claude/skills/**
