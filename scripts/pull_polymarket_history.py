@@ -189,7 +189,7 @@ def fetch_price_history(
                 "startTs":  start_ts,
                 "endTs":    end_ts,
             },
-            timeout=15,
+            timeout=(5, 12),  # (connect, read) — prevents server body-stall hangs
         )
         resp.raise_for_status()
         history = resp.json().get("history", [])
@@ -201,6 +201,10 @@ def fetch_price_history(
         df = df.set_index("datetime").rename(columns={"p": "price"})[["price"]]
         return df.sort_index()
 
+    except requests.exceptions.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "?"
+        logger.debug("CLOB %s for token %s", status, token_id[:16])
+        return pd.DataFrame()
     except Exception as exc:
         logger.debug("CLOB history error for token %s: %s", token_id[:16], exc)
         return pd.DataFrame()
@@ -265,6 +269,7 @@ def run(start: str, min_volume: float, force_full: bool, fidelity: int = 60) -> 
             "slug":         m.get("market_slug", m.get("slug", "")),
             "topic_bucket": classify_topic(m.get("question", "")),
             "yes_token_id": yes_token,
+            "start_date":   m.get("startDate", m.get("created_at", "")),
             "end_date":     m.get("endDate", m.get("end_date_iso", "")),
             "volume":       float(m.get("volumeNum", m.get("volume", 0)) or 0),
         })
@@ -290,6 +295,21 @@ def run(start: str, min_volume: float, force_full: bool, fidelity: int = 60) -> 
         # Resume: only fetch bars newer than last saved bar
         fetch_start = start_ts
         existing    = pd.DataFrame()
+
+        # Clamp fetch_start to the market's known start_date to skip pre-creation chunks.
+        # This avoids wasting 30+ chunk requests (each with 0.5s sleep) on markets that
+        # were created recently and have no data before their launch date.
+        market_start_str = row.get("start_date", "")
+        if market_start_str:
+            try:
+                mstart = int(
+                    datetime.strptime(str(market_start_str)[:10], "%Y-%m-%d")
+                    .replace(tzinfo=timezone.utc)
+                    .timestamp()
+                )
+                fetch_start = max(fetch_start, mstart)
+            except Exception:
+                pass
 
         if out_path.exists() and not force_full:
             try:
