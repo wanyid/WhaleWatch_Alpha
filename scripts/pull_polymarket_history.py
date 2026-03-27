@@ -20,13 +20,19 @@ Usage:
 import argparse
 import logging
 import json
+import socket
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from datetime import datetime, timezone
 from pathlib import Path
 import sys
 
 import pandas as pd
 import requests
+
+# Hard socket-level timeout — prevents zombie TCP connections from stalling
+# indefinitely on Windows even when requests timeout=(connect, read) is set.
+socket.setdefaulttimeout(30)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -191,10 +197,16 @@ def fetch_price_history(
     start_ts: int,
     end_ts: int,
     fidelity: int = 60,   # minutes per bucket (1 | 60 | 1440)
+    session: requests.Session | None = None,
 ) -> pd.DataFrame:
-    """Fetch YES price history for a single time window from CLOB prices-history."""
+    """Fetch YES price history for a single time window from CLOB prices-history.
+
+    Uses the provided session if given, otherwise falls back to the module-level
+    _session (used only during Gamma discovery).
+    """
+    sess = session if session is not None else _session
     try:
-        resp = _session.get(
+        resp = sess.get(
             f"{CLOB_BASE}/prices-history",
             params={
                 "market":   token_id,
@@ -229,6 +241,7 @@ def fetch_price_history_chunked(
     end_ts: int,
     fidelity: int = 60,
     chunk_days: int = CHUNK_DAYS,
+    session: requests.Session | None = None,
 ) -> pd.DataFrame:
     """Fetch full history by issuing multiple requests in chunk_days windows.
 
@@ -236,6 +249,9 @@ def fetch_price_history_chunked(
     hourly bars regardless of the requested start_ts. Chunking works around
     this: we slide a window from start_ts to end_ts in chunk_days increments
     and stitch the results together.
+
+    Each market gets its own isolated session (passed in) so there is no shared
+    TCP connection pool that can exhaust and silently hang after ~650 markets.
     """
     chunk_secs = chunk_days * 24 * 3600
     all_dfs: list[pd.DataFrame] = []
@@ -243,7 +259,7 @@ def fetch_price_history_chunked(
 
     while t < end_ts:
         t_end = min(t + chunk_secs, end_ts)
-        chunk = fetch_price_history(token_id, t, t_end, fidelity=fidelity)
+        chunk = fetch_price_history(token_id, t, t_end, fidelity=fidelity, session=session)
         if not chunk.empty:
             all_dfs.append(chunk)
         t = t_end
@@ -261,34 +277,46 @@ def fetch_price_history_chunked(
 # Main
 # ---------------------------------------------------------------------------
 
-def run(start: str, min_volume: float, force_full: bool, fidelity: int = 60) -> None:
+def run(start: str, min_volume: float, force_full: bool, fidelity: int = 60,
+        use_cached_catalog: bool = False) -> None:
     PRICES_DIR.mkdir(parents=True, exist_ok=True)
 
     start_ts = int(datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
     end_ts   = int(datetime.now(tz=timezone.utc).timestamp())
 
-    markets = discover_markets(start_date=start, min_volume=min_volume)
-
-    # Build metadata table
-    meta_rows = []
-    for m in markets:
-        yes_token = extract_yes_token(m)
-        if not yes_token:
-            continue
-        cid = m.get("conditionId", "")
-        meta_rows.append({
-            "condition_id": cid,
-            "question":     m.get("question", ""),
-            "slug":         m.get("market_slug", m.get("slug", "")),
-            "topic_bucket": classify_topic(m.get("question", "")),
-            "yes_token_id": yes_token,
-            "start_date":   m.get("startDate", m.get("created_at", "")),
-            "end_date":     m.get("endDate", m.get("end_date_iso", "")),
-            "volume":       float(m.get("volumeNum", m.get("volume", 0)) or 0),
-        })
-
-    meta_df = pd.DataFrame(meta_rows).drop_duplicates("condition_id")
     meta_path = POLY_DIR / "market_meta.parquet"
+
+    # --use-cached-catalog: skip the 12-min Gamma discovery and load the saved catalog.
+    # Safe to use on restarts since the catalog was already built on the first run.
+    if use_cached_catalog and meta_path.exists():
+        logger.info("Using cached market catalog: %s", meta_path)
+        meta_df = pd.read_parquet(meta_path)
+        logger.info("Loaded %d markets from catalog", len(meta_df))
+        for bucket, count in meta_df["topic_bucket"].value_counts().items():
+            logger.info("  %-14s  %d markets", bucket, count)
+    else:
+        markets = discover_markets(start_date=start, min_volume=min_volume)
+
+        # Build metadata table
+        meta_rows = []
+        for m in markets:
+            yes_token = extract_yes_token(m)
+            if not yes_token:
+                continue
+            cid = m.get("conditionId", "")
+            meta_rows.append({
+                "condition_id": cid,
+                "question":     m.get("question", ""),
+                "slug":         m.get("market_slug", m.get("slug", "")),
+                "topic_bucket": classify_topic(m.get("question", "")),
+                "yes_token_id": yes_token,
+                "start_date":   m.get("startDate", m.get("created_at", "")),
+                "end_date":     m.get("endDate", m.get("end_date_iso", "")),
+                "volume":       float(m.get("volumeNum", m.get("volume", 0)) or 0),
+            })
+
+        meta_df = pd.DataFrame(meta_rows).drop_duplicates("condition_id")
+        meta_path = POLY_DIR / "market_meta.parquet"
     meta_df.to_parquet(meta_path)
     logger.info("Saved %d markets metadata → %s", len(meta_df), meta_path)
 
@@ -296,9 +324,21 @@ def run(start: str, min_volume: float, force_full: bool, fidelity: int = 60) -> 
     for bucket, count in meta_df["topic_bucket"].value_counts().items():
         logger.info("  %-14s  %d markets", bucket, count)
 
-    # Pull price history for each market
+    # Pull price history for each market.
+    # Design: each market gets its own isolated requests.Session.
+    # This eliminates TCP connection-pool exhaustion — the root cause of silent
+    # hangs that previously occurred around market #650+. Background threads from
+    # timed-out markets are safely terminated by closing the market's session.
     n_ok = n_skip = n_fail = 0
     total = len(meta_df)
+
+    # PER_MARKET_TIMEOUT: must allow the worst-case full-history fetch.
+    # Worst case: market from 2024-01-01 → ~800 days / 25-day chunks = 32 chunks.
+    # At ~2s per chunk (1s HTTP + 0.5s sleep), that's ~64s. Use 120s for headroom.
+    # Log every LOG_EVERY markets so the watchdog (STALL_SECS=900s) stays satisfied:
+    # LOG_EVERY * PER_MARKET_TIMEOUT < 900s → 7 * 120 = 840s < 900s.
+    PER_MARKET_TIMEOUT = 120
+    LOG_EVERY          = 7
 
     for idx, (_, row) in enumerate(meta_df.iterrows(), 1):
         cid       = row["condition_id"]
@@ -338,13 +378,41 @@ def run(start: str, min_volume: float, force_full: bool, fidelity: int = 60) -> 
             except Exception:
                 existing = pd.DataFrame()
 
-        # Chunked fetch: slides CHUNK_DAYS windows across the full date range.
-        # A single fidelity=60 request is silently capped at ~28 days by the API.
-        new_df = fetch_price_history_chunked(
-            row["yes_token_id"], fetch_start, end_ts,
-            fidelity=fidelity, chunk_days=CHUNK_DAYS,
-        )
-        # Sleep already included inside fetch_price_history_chunked per chunk.
+        # Each market gets a dedicated session — isolated TCP pool, no shared state.
+        # On timeout: closing mkt_session immediately kills the background thread's
+        # next request (it gets a connection error), preventing zombie threads from
+        # accumulating and hammering the API on the abandoned session.
+        mkt_session = requests.Session()
+        mkt_session.headers.update({"Accept": "application/json"})
+        _ex = ThreadPoolExecutor(max_workers=1)
+        try:
+            _fut = _ex.submit(
+                fetch_price_history_chunked,
+                row["yes_token_id"], fetch_start, end_ts,
+                fidelity, CHUNK_DAYS, mkt_session,
+            )
+            new_df = _fut.result(timeout=PER_MARKET_TIMEOUT)
+        except FuturesTimeout:
+            logger.warning("Timeout after %ds on market %s — skipping", PER_MARKET_TIMEOUT, cid[:16])
+            _ex.shutdown(wait=False)   # abandon hung thread; don't block
+            mkt_session.close()        # kills background thread's next request
+            n_fail += 1
+            continue
+        except Exception as exc:
+            logger.warning("Error on market %s: %s — skipping", cid[:16], exc)
+            _ex.shutdown(wait=False)
+            mkt_session.close()
+            n_fail += 1
+            continue
+        finally:
+            # Normal path: thread already done, shutdown is instant.
+            # Timeout/error path: session already closed above before continue.
+            try:
+                _ex.shutdown(wait=False)
+            except Exception:
+                pass
+
+        mkt_session.close()  # normal path: clean up after successful fetch
 
         if new_df.empty:
             n_fail += 1
@@ -359,7 +427,7 @@ def run(start: str, min_volume: float, force_full: bool, fidelity: int = 60) -> 
         combined.to_parquet(out_path)
         n_ok += 1
 
-        if idx % 25 == 0 or idx == total:
+        if idx % LOG_EVERY == 0 or idx == total:
             logger.info(
                 "[%d/%d]  pulled=%d  skipped=%d  failed=%d",
                 idx, total, n_ok, n_skip, n_fail,
@@ -380,6 +448,9 @@ if __name__ == "__main__":
                         help="Re-fetch all history even if local file exists")
     parser.add_argument("--fidelity", type=int, default=60,
                         help="Bar size in minutes: 60=hourly (default), 1440=daily")
+    parser.add_argument("--use-cached-catalog", action="store_true",
+                        help="Skip Gamma discovery and use existing market_meta.parquet")
     args = parser.parse_args()
     run(start=args.start, min_volume=args.min_volume,
-        force_full=args.force_full, fidelity=args.fidelity)
+        force_full=args.force_full, fidelity=args.fidelity,
+        use_cached_catalog=args.use_cached_catalog)
