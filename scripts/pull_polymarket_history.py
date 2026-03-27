@@ -329,17 +329,41 @@ def run(start: str, min_volume: float, force_full: bool, fidelity: int = 60,
     # Pull price history for each market.
     # Design: each market gets its own isolated requests.Session.
     # This eliminates TCP connection-pool exhaustion — the root cause of silent
-    # hangs that previously occurred around market #650+. Background threads from
-    # timed-out markets are safely terminated by closing the market's session.
+    # hangs that previously occurred around market #650+.
+    #
+    # On Windows, requests.get(timeout=...) occasionally hangs on specific markets
+    # (zombie TCP state). The external watchdog kills and restarts the process.
+    # To avoid re-hanging on the SAME market, we write a progress marker before
+    # each fetch. On --use-cached-catalog restarts, markets up to the marker are
+    # skipped (they either already have files or were the one that caused the hang).
     n_ok = n_skip = n_fail = 0
     total = len(meta_df)
-
-    # Log every LOG_EVERY markets so the external watchdog (STALL_SECS=900s)
-    # sees file growth. With direct calls (no ThreadPoolExecutor), each market
-    # takes at most ~50s (32 chunks × 1.5s). 10 * 50s = 500s < 900s.
     LOG_EVERY = 10
 
+    # Progress marker: records the last market idx that was ATTEMPTED.
+    # On restart after a watchdog kill, skip to marker+1 so we don't re-hang
+    # on the same problematic market.
+    progress_path = POLY_DIR / ".pull_progress"
+    resume_from = 0
+    if use_cached_catalog and progress_path.exists():
+        try:
+            resume_from = int(progress_path.read_text().strip())
+            logger.info("Resuming from market %d (skipping previously attempted markets)", resume_from + 1)
+        except Exception:
+            resume_from = 0
+
     for idx, (_, row) in enumerate(meta_df.iterrows(), 1):
+        # Skip markets already attempted in a previous run (before watchdog kill)
+        if idx <= resume_from:
+            cid = row["condition_id"]
+            safe_id = cid.replace("0x", "")[:24]
+            out_path = PRICES_DIR / f"{safe_id}.parquet"
+            if out_path.exists():
+                n_skip += 1
+            else:
+                n_fail += 1  # was attempted but never saved → skip it
+            continue
+
         cid       = row["condition_id"]
         safe_id   = cid.replace("0x", "")[:24]
         out_path  = PRICES_DIR / f"{safe_id}.parquet"
@@ -349,8 +373,6 @@ def run(start: str, min_volume: float, force_full: bool, fidelity: int = 60,
         existing    = pd.DataFrame()
 
         # Clamp fetch_start to the market's known start_date to skip pre-creation chunks.
-        # This avoids wasting 30+ chunk requests (each with 0.5s sleep) on markets that
-        # were created recently and have no data before their launch date.
         market_start_str = row.get("start_date", "")
         if market_start_str:
             try:
@@ -377,14 +399,11 @@ def run(start: str, min_volume: float, force_full: bool, fidelity: int = 60,
             except Exception:
                 existing = pd.DataFrame()
 
+        # Write progress marker BEFORE fetch — if we hang here, the watchdog
+        # kills us and on restart we skip past this market.
+        progress_path.write_text(str(idx))
+
         # Each market gets a dedicated session — isolated TCP pool, no shared state.
-        # No ThreadPoolExecutor: creating hundreds of executors accumulated zombie
-        # threads that eventually blocked the main thread on new thread creation,
-        # causing silent freezes around market 700-800.
-        # Instead, call fetch directly with per-request timeouts:
-        #   - timeout=(5, 12) on each HTTP request
-        #   - socket.setdefaulttimeout(30) as OS-level backstop
-        #   - External watchdog in run_pipeline.py as final safety net
         mkt_session = requests.Session()
         mkt_session.headers.update({"Accept": "application/json"})
         try:
@@ -417,6 +436,12 @@ def run(start: str, min_volume: float, force_full: bool, fidelity: int = 60,
                 "[%d/%d]  pulled=%d  skipped=%d  failed=%d",
                 idx, total, n_ok, n_skip, n_fail,
             )
+
+    # Clean up progress marker on successful completion
+    try:
+        progress_path.unlink(missing_ok=True)
+    except Exception:
+        pass
 
     logger.info("Done.  Pulled: %d  Skipped (up to date): %d  Failed: %d", n_ok, n_skip, n_fail)
     logger.info("Price files → %s  (fidelity=%dm)", PRICES_DIR, fidelity)
