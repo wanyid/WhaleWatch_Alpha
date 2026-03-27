@@ -228,3 +228,33 @@ config: add data_start_date and LLM provider settings to settings.yaml
   `.env.example` may contain real credentials and must never reach GitHub.
 - `data/`, `*.db`, `*.sqlite` — local artifacts
 - `__pycache__/`, `.claude/` — see `.gitignore`
+
+---
+
+## Model Design & Testing Skills
+
+Three skills are configured for all Layer 2 predictor work. Invoke them before writing
+or reviewing any model training, evaluation, or diagnostic code.
+
+| Task | Skill to invoke |
+|------|----------------|
+| Training pipelines, CV splits, calibration, `TimeSeriesSplit`, `CalibratedClassifierCV` | `scientific-skills:scikit-learn` |
+| Walk-forward diagnostics, Brier decomposition, statistical tests on OOS results | `scientific-skills:statsmodels` |
+| Feature importance, SHAP values for XGBoost confidence model explainability | `scientific-skills:shap` |
+
+### When to invoke
+
+- **Before writing any new training script** or modifying `train_*.py` — invoke `scikit-learn`
+- **Before evaluating OOS results or diagnosing model degradation** — invoke `statsmodels`
+- **Before running feature selection or debugging a low-Brier model** — invoke `shap`
+- **When `check_model_staleness.py` flags STALE** — invoke all three in sequence:
+  1. `shap` to identify which features degraded
+  2. `statsmodels` to test whether regime shift is statistically significant
+  3. `scikit-learn` to retrain with updated hyperparameters
+
+### Layer 2 model files
+- `reasoner/layer2_predictor/stat_predictor.py` — logistic regression baseline
+- `reasoner/layer2_predictor/nn_predictor.py` — neural network (future)
+- `scripts/train_post_model.py` / `train_poly_model.py` — directional models
+- `scripts/train_post_fade_model.py` / `train_poly_fade_model.py` — fade models
+- `scripts/check_model_staleness.py` — staleness checker (rolling Brier vs training Brier)
