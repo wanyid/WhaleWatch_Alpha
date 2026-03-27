@@ -22,7 +22,9 @@ import logging
 import json
 import socket
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+# ThreadPoolExecutor removed — accumulating thread objects caused main-thread
+# freezes after ~700 markets.  Direct calls + per-market sessions are simpler
+# and fully reliable; the external watchdog handles rare socket-level hangs.
 from datetime import datetime, timezone
 from pathlib import Path
 import sys
@@ -332,13 +334,10 @@ def run(start: str, min_volume: float, force_full: bool, fidelity: int = 60,
     n_ok = n_skip = n_fail = 0
     total = len(meta_df)
 
-    # PER_MARKET_TIMEOUT: must allow the worst-case full-history fetch.
-    # Worst case: market from 2024-01-01 → ~800 days / 25-day chunks = 32 chunks.
-    # At ~2s per chunk (1s HTTP + 0.5s sleep), that's ~64s. Use 120s for headroom.
-    # Log every LOG_EVERY markets so the watchdog (STALL_SECS=900s) stays satisfied:
-    # LOG_EVERY * PER_MARKET_TIMEOUT < 900s → 7 * 120 = 840s < 900s.
-    PER_MARKET_TIMEOUT = 120
-    LOG_EVERY          = 7
+    # Log every LOG_EVERY markets so the external watchdog (STALL_SECS=900s)
+    # sees file growth. With direct calls (no ThreadPoolExecutor), each market
+    # takes at most ~50s (32 chunks × 1.5s). 10 * 50s = 500s < 900s.
+    LOG_EVERY = 10
 
     for idx, (_, row) in enumerate(meta_df.iterrows(), 1):
         cid       = row["condition_id"]
@@ -379,40 +378,26 @@ def run(start: str, min_volume: float, force_full: bool, fidelity: int = 60,
                 existing = pd.DataFrame()
 
         # Each market gets a dedicated session — isolated TCP pool, no shared state.
-        # On timeout: closing mkt_session immediately kills the background thread's
-        # next request (it gets a connection error), preventing zombie threads from
-        # accumulating and hammering the API on the abandoned session.
+        # No ThreadPoolExecutor: creating hundreds of executors accumulated zombie
+        # threads that eventually blocked the main thread on new thread creation,
+        # causing silent freezes around market 700-800.
+        # Instead, call fetch directly with per-request timeouts:
+        #   - timeout=(5, 12) on each HTTP request
+        #   - socket.setdefaulttimeout(30) as OS-level backstop
+        #   - External watchdog in run_pipeline.py as final safety net
         mkt_session = requests.Session()
         mkt_session.headers.update({"Accept": "application/json"})
-        _ex = ThreadPoolExecutor(max_workers=1)
         try:
-            _fut = _ex.submit(
-                fetch_price_history_chunked,
+            new_df = fetch_price_history_chunked(
                 row["yes_token_id"], fetch_start, end_ts,
                 fidelity, CHUNK_DAYS, mkt_session,
             )
-            new_df = _fut.result(timeout=PER_MARKET_TIMEOUT)
-        except FuturesTimeout:
-            logger.warning("Timeout after %ds on market %s — skipping", PER_MARKET_TIMEOUT, cid[:16])
-            _ex.shutdown(wait=False)   # abandon hung thread; don't block
-            mkt_session.close()        # kills background thread's next request
-            n_fail += 1
-            continue
         except Exception as exc:
             logger.warning("Error on market %s: %s — skipping", cid[:16], exc)
-            _ex.shutdown(wait=False)
-            mkt_session.close()
             n_fail += 1
             continue
         finally:
-            # Normal path: thread already done, shutdown is instant.
-            # Timeout/error path: session already closed above before continue.
-            try:
-                _ex.shutdown(wait=False)
-            except Exception:
-                pass
-
-        mkt_session.close()  # normal path: clean up after successful fetch
+            mkt_session.close()
 
         if new_df.empty:
             n_fail += 1
