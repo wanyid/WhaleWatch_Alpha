@@ -414,10 +414,10 @@ def _build_executor(market_provider) -> BaseExecutor:
     except Exception:
         provider = "paper"
 
-    if provider == "alpaca":
-        from executor.alpaca_executor import AlpacaExecutor
-        logger.info("Executor: AlpacaExecutor (LIVE)")
-        return AlpacaExecutor()
+    if provider == "schwab":
+        from executor.schwab_executor import SchwabExecutor
+        logger.info("Executor: SchwabExecutor (LIVE)")
+        return SchwabExecutor()
 
     logger.info("Executor: PaperExecutor")
     return PaperExecutor(market_provider)

@@ -69,17 +69,18 @@ risk:
 
 executor:
   # "paper"  = local SQLite simulation, no broker required (default)
-  # "alpaca" = live trading via Alpaca API (requires ALPACA_API_KEY + ALPACA_SECRET_KEY in .env)
-  #            Always run "paper" first to validate strategy before switching to "alpaca".
+  # "schwab" = live trading via Charles Schwab API (requires SCHWAB_* vars in .env
+  #            and token file created by scripts/setup_schwab_auth.py)
+  #            Always run "paper" first to validate strategy before switching to "schwab".
   provider: "paper"
   paper_db_path: "D:/WhaleWatch_Data/paper_trades.db"
 
-  # Alpaca settings (only used when provider = "alpaca")
-  alpaca_db_path: "D:/WhaleWatch_Data/alpaca_trades.db"
-  alpaca_notional_per_trade: 1000       # USD notional per signal (fractional shares supported)
+  # Schwab settings (only used when provider = "schwab")
+  schwab_db_path: "D:/WhaleWatch_Data/schwab_trades.db"
+  schwab_notional_per_trade: 1000       # USD notional per signal; converted to whole shares
   # VIX is not directly tradeable — map to a proxy ETF.
   # BUY VIX  → buy this ticker (vol long)
-  # SHORT VIX → short this ticker (requires margin)
+  # SHORT VIX → short this ticker (requires margin account)
   vix_proxy_ticker: "UVXY"
 
 # Fade model parameters (Option B)

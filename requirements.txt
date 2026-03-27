@@ -18,7 +18,7 @@ pyyaml>=6.0
 python-dotenv>=1.0.0
 
 # Broker
-alpaca-py>=0.31.0
+schwab-py>=0.4.0
 
 # Storage
 sqlalchemy>=2.0.0

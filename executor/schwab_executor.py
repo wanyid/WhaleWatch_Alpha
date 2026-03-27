@@ -1,31 +1,32 @@
-"""AlpacaExecutor — live broker integration via Alpaca Markets API.
+"""SchwabExecutor — live broker integration via Charles Schwab API (schwab-py).
 
 Use PaperExecutor for all simulation and strategy validation.
 Switch to this executor only when ready to trade with real money.
 
-Swap in by setting settings.yaml → executor.provider: "alpaca"
-and populating ALPACA_API_KEY + ALPACA_SECRET_KEY in .env.
+Swap in by setting settings.yaml → executor.provider: "schwab"
+and populating the required credentials in .env (see below).
 
-Position tracking is mirrored to a local SQLite database so that holding-period
-timeouts, True News Stops, and session summaries work exactly like PaperExecutor.
-The Alpaca order_id is stored alongside our internal UUID for reconciliation.
+---- First-time setup ----
+1. Register a developer app at https://developer.schwab.com/
+2. Set the callback URL to https://127.0.0.1:8182 in the app settings
+3. Add credentials to .env:
+     SCHWAB_API_KEY=your_app_key
+     SCHWAB_APP_SECRET=your_app_secret
+     SCHWAB_ACCOUNT_HASH=your_account_hash   (from get_account_numbers())
+     SCHWAB_TOKEN_PATH=D:/WhaleWatch_Data/schwab_token.json
+4. Run the one-time auth helper to create the token file:
+     python scripts/setup_schwab_auth.py
+5. Re-run the auth helper every 7 days — Schwab's refresh token expires weekly.
 
-VIX note:
-  VIX is not directly tradeable on Alpaca. It is mapped to a proxy ETF configured
-  in settings.yaml → executor.vix_proxy_ticker (default: UVXY).
-  BUY VIX  → buy UVXY  (volatility long)
-  SHORT VIX → short UVXY (requires margin)
-
-Usage:
-  # In .env:
-  ALPACA_API_KEY=your_key
-  ALPACA_SECRET_KEY=your_secret
-
-  # In settings.yaml:
-  executor:
-    provider: "alpaca"
-    alpaca_notional_per_trade: 1000
-    vix_proxy_ticker: "UVXY"
+---- Behaviour ----
+- Orders are whole-share market orders. Qty = floor(notional / last_price).
+  Minimum 1 share per signal.
+- BUY direction  → equity_buy_market / close with equity_sell_market
+- SHORT direction → equity_sell_short_market / close with equity_buy_to_cover_market
+- VIX is not directly tradeable — mapped to proxy ETF via settings.yaml
+  executor.vix_proxy_ticker (default: UVXY)
+- Position tracking mirrored to local SQLite so holding-period timeouts,
+  True News Stops, and session summaries work identically to PaperExecutor.
 """
 
 import logging
@@ -43,22 +44,22 @@ from models.signal_event import SignalEvent
 
 logger = logging.getLogger(__name__)
 
-_SETTINGS_PATH = "config/settings.yaml"
-_DEFAULT_DB     = "D:/WhaleWatch_Data/alpaca_trades.db"
-_FILL_POLL_SEC  = 0.5   # interval between fill-status polls
-_FILL_TIMEOUT   = 10    # max seconds to wait for a fill before logging a warning
+_SETTINGS_PATH  = "config/settings.yaml"
+_DEFAULT_DB     = "D:/WhaleWatch_Data/schwab_trades.db"
+_FILL_POLL_SEC  = 0.5
+_FILL_TIMEOUT   = 15    # Schwab fills can be slightly slower than Alpaca
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS positions (
     order_id            TEXT PRIMARY KEY,   -- our internal UUID
-    alpaca_order_id     TEXT,               -- Alpaca-assigned order ID
+    schwab_order_id     TEXT,               -- Schwab-assigned order ID
     event_id            TEXT NOT NULL,
     created_at          TEXT NOT NULL,
     signal_direction    TEXT NOT NULL,
     signal_ticker       TEXT NOT NULL,      -- original (SPY | QQQ | VIX)
-    alpaca_ticker       TEXT NOT NULL,      -- actual symbol submitted to Alpaca
-    notional            REAL,               -- USD notional of the order
-    filled_qty          REAL,               -- shares filled (for closing)
+    schwab_ticker       TEXT NOT NULL,      -- actual symbol submitted to Schwab
+    notional            REAL,               -- USD notional target
+    filled_qty          REAL,               -- whole shares filled (for closing)
     confidence          REAL,
     holding_period_min  INTEGER,
     stop_loss_pct       REAL,
@@ -90,48 +91,75 @@ def _load_settings() -> dict:
         return {}
 
 
-class AlpacaExecutor(BaseExecutor):
-    """Broker executor via Alpaca Markets API (paper or live).
+class SchwabExecutor(BaseExecutor):
+    """Broker executor via Charles Schwab API (schwab-py).
 
-    Requires alpaca-py>=0.31.0  (pip install alpaca-py).
-    Credentials: ALPACA_API_KEY + ALPACA_SECRET_KEY in .env.
+    Requires schwab-py>=0.4.0  (pip install schwab-py).
+    Credentials: SCHWAB_API_KEY, SCHWAB_APP_SECRET, SCHWAB_ACCOUNT_HASH,
+                 SCHWAB_TOKEN_PATH  — all in .env.
+    Run scripts/setup_schwab_auth.py once to create the token file.
+    Re-run every 7 days when Schwab's refresh token expires.
     """
 
     def __init__(self) -> None:
-        # Late import so the rest of the app doesn't hard-depend on alpaca-py
         try:
-            from alpaca.trading.client import TradingClient
-            from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
-            from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
+            import schwab
+            from schwab import auth
+            from schwab.orders.equities import (
+                equity_buy_market,
+                equity_sell_market,
+                equity_sell_short_market,
+                equity_buy_to_cover_market,
+            )
+            from schwab.utils import Utils
         except ImportError as exc:
             raise ImportError(
-                "alpaca-py is required for AlpacaExecutor. "
-                "Run: pip install alpaca-py>=0.31.0"
+                "schwab-py is required for SchwabExecutor. "
+                "Run: pip install schwab-py>=0.4.0"
             ) from exc
 
         import os
-        api_key    = os.getenv("ALPACA_API_KEY", "")
-        secret_key = os.getenv("ALPACA_SECRET_KEY", "")
-        if not api_key or not secret_key:
+        api_key      = os.getenv("SCHWAB_API_KEY", "")
+        app_secret   = os.getenv("SCHWAB_APP_SECRET", "")
+        account_hash = os.getenv("SCHWAB_ACCOUNT_HASH", "")
+        token_path   = os.getenv("SCHWAB_TOKEN_PATH", "D:/WhaleWatch_Data/schwab_token.json")
+
+        missing = [k for k, v in {
+            "SCHWAB_API_KEY": api_key,
+            "SCHWAB_APP_SECRET": app_secret,
+            "SCHWAB_ACCOUNT_HASH": account_hash,
+        }.items() if not v]
+        if missing:
             raise EnvironmentError(
-                "ALPACA_API_KEY and ALPACA_SECRET_KEY must be set in .env "
-                "to use AlpacaExecutor."
+                f"Missing required env vars for SchwabExecutor: {', '.join(missing)}. "
+                "Add them to .env and run scripts/setup_schwab_auth.py for first-time token setup."
             )
 
+        if not Path(token_path).exists():
+            raise FileNotFoundError(
+                f"Schwab token file not found: {token_path}\n"
+                "Run: python scripts/setup_schwab_auth.py"
+            )
+
+        self._client       = auth.client_from_token_file(token_path, api_key, app_secret)
+        self._account_hash = account_hash
+        self._Utils        = Utils
+
+        # Store order builder functions for use in methods
+        self._equity_buy_market          = equity_buy_market
+        self._equity_sell_market         = equity_sell_market
+        self._equity_sell_short_market   = equity_sell_short_market
+        self._equity_buy_to_cover_market = equity_buy_to_cover_market
+
         cfg = _load_settings().get("executor", {})
-        self._notional  = float(cfg.get("alpaca_notional_per_trade", 1000))
+        self._notional  = float(cfg.get("schwab_notional_per_trade", 1000))
         self._vix_proxy = cfg.get("vix_proxy_ticker", "UVXY")
-        self._db_path   = cfg.get("alpaca_db_path", _DEFAULT_DB)
+        self._db_path   = cfg.get("schwab_db_path", _DEFAULT_DB)
 
-        self._client              = TradingClient(api_key, secret_key, paper=False)
-        self._OrderSide           = OrderSide
-        self._TimeInForce         = TimeInForce
-        self._QueryOrderStatus    = QueryOrderStatus
-        self._MarketOrderRequest  = MarketOrderRequest
-        self._GetOrdersRequest    = GetOrdersRequest
-
-        logger.info("AlpacaExecutor initialised (LIVE, notional=$%.0f)", self._notional)
-
+        logger.info(
+            "SchwabExecutor initialised (LIVE, notional=$%.0f, vix_proxy=%s)",
+            self._notional, self._vix_proxy,
+        )
         self._init_db()
 
     # ------------------------------------------------------------------
@@ -139,45 +167,51 @@ class AlpacaExecutor(BaseExecutor):
     # ------------------------------------------------------------------
 
     def submit_signal(self, event: SignalEvent) -> str:
-        """Place a market order on Alpaca and record the position locally."""
-        order_id    = str(uuid.uuid4())
-        alpaca_sym  = self._map_ticker(event.signal_ticker)
-        side        = (self._OrderSide.BUY
-                       if event.signal_direction == "BUY"
-                       else self._OrderSide.SELL)
+        """Place a live market order on Schwab and record the position locally."""
+        order_id   = str(uuid.uuid4())
+        schwab_sym = self._map_ticker(event.signal_ticker)
 
-        req = self._MarketOrderRequest(
-            symbol=alpaca_sym,
-            notional=self._notional,
-            side=side,
-            time_in_force=self._TimeInForce.DAY,
-        )
+        # Get current price to compute whole-share quantity
+        current_price = self._get_last_price(schwab_sym)
+        if not current_price:
+            raise RuntimeError(f"Could not get quote for {schwab_sym} — aborting signal")
+
+        qty = max(1, int(self._notional / current_price))
+
+        if event.signal_direction == "BUY":
+            order_req = self._equity_buy_market(schwab_sym, qty)
+        else:  # SHORT
+            order_req = self._equity_sell_short_market(schwab_sym, qty)
 
         try:
-            order = self._client.submit_order(req)
-            alpaca_order_id = str(order.id)
+            resp = self._client.place_order(self._account_hash, order_req)
+            schwab_order_id = str(self._Utils.extract_order_id(resp))
         except Exception as exc:
-            logger.error("Alpaca submit_order failed: %s", exc)
+            logger.error("Schwab place_order failed: %s", exc)
             raise
 
-        # Poll for fill to get filled_avg_price and filled_qty
-        entry_price, filled_qty = self._await_fill(alpaca_order_id)
+        entry_price, filled_qty = self._await_fill(schwab_order_id)
+        # Fall back to the pre-order quote if fill price not captured in time
+        if entry_price is None:
+            entry_price = current_price
+        if filled_qty is None:
+            filled_qty = float(qty)
 
         with self._conn() as conn:
             conn.execute(
                 """
                 INSERT INTO positions
-                  (order_id, alpaca_order_id, event_id, created_at,
-                   signal_direction, signal_ticker, alpaca_ticker,
+                  (order_id, schwab_order_id, event_id, created_at,
+                   signal_direction, signal_ticker, schwab_ticker,
                    notional, filled_qty, confidence, holding_period_min,
                    stop_loss_pct, take_profit_pct, entry_price, outcome,
                    poly_market_id, poly_entry_prob)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'OPEN',?,?)
                 """,
                 (
-                    order_id, alpaca_order_id, event_id := event.event_id,
+                    order_id, schwab_order_id, event.event_id,
                     event.created_at.isoformat(),
-                    event.signal_direction, event.signal_ticker, alpaca_sym,
+                    event.signal_direction, event.signal_ticker, schwab_sym,
                     self._notional, filled_qty,
                     event.confidence, event.holding_period_minutes,
                     event.stop_loss_pct, event.take_profit_pct,
@@ -189,19 +223,19 @@ class AlpacaExecutor(BaseExecutor):
         event.market_price_at_signal = entry_price
 
         logger.info(
-            "ALPACA OPEN  order=%s  alpaca=%s  %s %s  entry=%.4f  qty=%.4f  hold=%dm",
-            order_id[:8], alpaca_order_id[:8],
-            event.signal_direction, alpaca_sym,
-            entry_price or 0, filled_qty or 0,
+            "SCHWAB OPEN  order=%s  schwab=%s  %s %s  qty=%d  entry=%.4f  hold=%dm",
+            order_id[:8], schwab_order_id,
+            event.signal_direction, schwab_sym,
+            int(filled_qty), entry_price or 0,
             event.holding_period_minutes or 0,
         )
         return order_id
 
     def close_position(self, order_id: str, reason: str = "MANUAL") -> Optional[float]:
-        """Close an open position by placing the opposing market order."""
+        """Close an open position with the appropriate closing order type."""
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT signal_direction, alpaca_ticker, entry_price, "
+                "SELECT signal_direction, schwab_ticker, entry_price, "
                 "filled_qty, stop_loss_pct, take_profit_pct "
                 "FROM positions WHERE order_id=? AND outcome='OPEN'",
                 (order_id,),
@@ -211,38 +245,25 @@ class AlpacaExecutor(BaseExecutor):
             logger.warning("close_position: order %s not found or already closed", order_id)
             return None
 
-        direction, alpaca_sym, entry_price, filled_qty, sl_pct, tp_pct = row
+        direction, schwab_sym, entry_price, filled_qty, sl_pct, tp_pct = row
+        qty = max(1, int(filled_qty or 1))
 
-        # Opposing side to close
-        close_side = (self._OrderSide.SELL
-                      if direction == "BUY"
-                      else self._OrderSide.BUY)
-
-        if filled_qty and filled_qty > 0:
-            # Use exact qty for the closing leg
-            req = self._MarketOrderRequest(
-                symbol=alpaca_sym,
-                qty=round(filled_qty, 9),
-                side=close_side,
-                time_in_force=self._TimeInForce.DAY,
-            )
-        else:
-            # Fallback to notional close if qty wasn't captured
-            req = self._MarketOrderRequest(
-                symbol=alpaca_sym,
-                notional=self._notional,
-                side=close_side,
-                time_in_force=self._TimeInForce.DAY,
-            )
+        # Correct closing order type per direction
+        if direction == "BUY":
+            close_req = self._equity_sell_market(schwab_sym, qty)
+        else:  # SHORT was opened with sell_short → close with buy_to_cover
+            close_req = self._equity_buy_to_cover_market(schwab_sym, qty)
 
         try:
-            close_order = self._client.submit_order(req)
-            close_alpaca_id = str(close_order.id)
+            resp = self._client.place_order(self._account_hash, close_req)
+            close_schwab_id = str(self._Utils.extract_order_id(resp))
         except Exception as exc:
-            logger.error("Alpaca close_order failed for %s: %s", order_id[:8], exc)
+            logger.error("Schwab close_order failed for %s: %s", order_id[:8], exc)
             return None
 
-        exit_price, _ = self._await_fill(close_alpaca_id)
+        exit_price, _ = self._await_fill(close_schwab_id)
+        if exit_price is None:
+            exit_price = self._get_last_price(schwab_sym)
 
         pnl     = self._compute_pnl(direction, entry_price, exit_price, sl_pct, tp_pct)
         outcome = self._classify_outcome(pnl, direction, entry_price, exit_price, sl_pct, tp_pct)
@@ -260,8 +281,8 @@ class AlpacaExecutor(BaseExecutor):
             self._upsert_daily_pnl(conn, pnl, outcome)
 
         logger.info(
-            "ALPACA CLOSE order=%s  %s %s  entry=%.4f  exit=%.4f  pnl=%.4f  %s  reason=%s",
-            order_id[:8], direction, alpaca_sym,
+            "SCHWAB CLOSE order=%s  %s %s  entry=%.4f  exit=%.4f  pnl=%.4f  %s  reason=%s",
+            order_id[:8], direction, schwab_sym,
             entry_price or 0, exit_price or 0, pnl, outcome, reason,
         )
         return pnl
@@ -351,32 +372,45 @@ class AlpacaExecutor(BaseExecutor):
     # ------------------------------------------------------------------
 
     def _map_ticker(self, signal_ticker: str) -> str:
-        """Map signal ticker to a tradeable Alpaca symbol."""
         if signal_ticker.upper() == "VIX":
             return self._vix_proxy
         return signal_ticker.upper()
 
-    def _await_fill(self, alpaca_order_id: str) -> tuple[Optional[float], Optional[float]]:
-        """Poll until the order is filled or timeout. Returns (filled_avg_price, filled_qty)."""
+    def _get_last_price(self, symbol: str) -> Optional[float]:
+        """Fetch the last trade price for a symbol via Schwab quotes API."""
+        try:
+            resp = self._client.get_quotes([symbol])
+            data = resp.json()
+            return float(data[symbol]["quote"]["lastPrice"])
+        except Exception as exc:
+            logger.warning("Could not fetch quote for %s: %s", symbol, exc)
+            return None
+
+    def _await_fill(self, schwab_order_id: str) -> tuple[Optional[float], Optional[float]]:
+        """Poll until the order is filled or timeout. Returns (avg_price, filled_qty)."""
         deadline = time.monotonic() + _FILL_TIMEOUT
         while time.monotonic() < deadline:
             try:
-                order = self._client.get_order_by_id(alpaca_order_id)
-                status = str(order.status).lower()
-                if status in ("filled", "partially_filled"):
-                    price = float(order.filled_avg_price) if order.filled_avg_price else None
-                    qty   = float(order.filled_qty)       if order.filled_qty       else None
-                    return price, qty
-                if status in ("canceled", "expired", "rejected"):
-                    logger.warning("Alpaca order %s ended with status: %s", alpaca_order_id[:8], status)
+                resp  = self._client.get_order(schwab_order_id, self._account_hash)
+                order = resp.json()
+                status = str(order.get("status", "")).upper()
+                if status == "FILLED":
+                    avg_price  = order.get("averagePrice")
+                    filled_qty = order.get("filledQuantity")
+                    return (
+                        float(avg_price)  if avg_price  is not None else None,
+                        float(filled_qty) if filled_qty is not None else None,
+                    )
+                if status in ("CANCELED", "EXPIRED", "REJECTED"):
+                    logger.warning("Schwab order %s ended with status: %s", schwab_order_id, status)
                     return None, None
             except Exception as exc:
-                logger.debug("Poll fill error for %s: %s", alpaca_order_id[:8], exc)
+                logger.debug("Poll fill error for %s: %s", schwab_order_id, exc)
             time.sleep(_FILL_POLL_SEC)
 
         logger.warning(
-            "Alpaca order %s did not fill within %ds — entry price unknown",
-            alpaca_order_id[:8], _FILL_TIMEOUT,
+            "Schwab order %s did not fill within %ds — using pre-order quote as fallback",
+            schwab_order_id, _FILL_TIMEOUT,
         )
         return None, None
 
