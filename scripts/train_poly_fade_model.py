@@ -147,9 +147,10 @@ def _build_calibrated_model(
     from sklearn.model_selection import TimeSeriesSplit
     from xgboost import XGBClassifier
 
-    n_pos = int(y.sum())
-    n_neg = len(y) - n_pos
-    spw   = min(n_neg / max(n_pos, 1), 5.0)
+    n_pos    = int(y.sum())
+    n_neg    = len(y) - n_pos
+    pos_rate = n_pos / max(len(y), 1)
+    spw      = min(n_neg / max(n_pos, 1), 5.0) if (pos_rate < 0.35 or pos_rate > 0.65) else 1.0
 
     base = XGBClassifier(
         n_estimators=200,
@@ -162,7 +163,7 @@ def _build_calibrated_model(
         random_state=42,
         verbosity=0,
     )
-    method = "isotonic" if len(y) >= 150 else "sigmoid"
+    method = "isotonic" if len(y) >= 500 else "sigmoid"
     clf    = CalibratedClassifierCV(base, method=method, cv=TimeSeriesSplit(n_splits=3))
     fit_kw = {} if sample_weight is None else {"sample_weight": sample_weight}
     clf.fit(X, y, **fit_kw)
@@ -290,10 +291,13 @@ def train_period(
     X = df_valid[features]
     y = df_valid[lbl_col]
 
-    pos_rate  = float(y.mean())
-    n_pos     = int(y.sum())
-    n_neg     = len(y) - n_pos
-    spw_approx = min(n_neg / max(n_pos, 1), 5.0)
+    pos_rate   = float(y.mean())
+    n_pos      = int(y.sum())
+    n_neg      = len(y) - n_pos
+    spw_approx = (
+        min(n_neg / max(n_pos, 1), 5.0)
+        if (pos_rate < 0.35 or pos_rate > 0.65) else 1.0
+    )
 
     logger.info(
         "  %s: n_train=%d  pos_rate=%.1f%%  (fade_worked=%d  not_faded=%d)",

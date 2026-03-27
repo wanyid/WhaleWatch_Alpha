@@ -74,6 +74,10 @@ def _l2_min_confidence() -> float:
     return _CFG.get("reasoner", {}).get("layer2", {}).get("min_confidence", 0.60)
 
 
+def _dual_signal_bonus() -> float:
+    return _CFG.get("reasoner", {}).get("layer2", {}).get("dual_signal_confidence_bonus", 0.0)
+
+
 # ---------------------------------------------------------------------------
 # Signal deduplication — prevent re-processing the same event twice
 # ---------------------------------------------------------------------------
@@ -261,6 +265,14 @@ def _run_poly_session_pipeline(
     event.confidence = session.confidence
     event.holding_period_minutes = session.holding_period_minutes
 
+    # Dual-signal confidence bonus: when both Poly and TS signal the same
+    # direction, apply a configurable additive boost (settings.yaml).
+    if event.dual_signal:
+        bonus = _dual_signal_bonus()
+        if bonus > 0:
+            event.confidence = min(event.confidence + bonus, 1.0)
+            logger.debug("Dual-signal bonus +%.2f → confidence=%.3f", bonus, event.confidence)
+
     if not risk.approve(event):
         return None
 
@@ -305,6 +317,13 @@ def run_pipeline(
         logger.warning("L2 failed for event %s: %s — using fallback 0.50", event.event_id[:8], exc)
         event.confidence = 0.50
         event.holding_period_minutes = 60
+
+    # Dual-signal confidence bonus (Truth Social path)
+    if event.dual_signal:
+        bonus = _dual_signal_bonus()
+        if bonus > 0:
+            event.confidence = min(event.confidence + bonus, 1.0)
+            logger.debug("Dual-signal bonus +%.2f → confidence=%.3f", bonus, event.confidence)
 
     # --- Risk check ---
     if not risk.approve(event):

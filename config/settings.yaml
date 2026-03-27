@@ -43,8 +43,19 @@ reasoner:
     max_holding_minutes: 4320       # 3 days
     # VIX threshold for regime routing (Decision #8)
     vix_regime_threshold: 20.0
-    # Default model period to use for live inference
+    # Default model period to use for live inference.
+    # Choose based on OOS Brier score printed at the end of each training run
+    # (lower is better).  Re-evaluate after every retrain — the best period
+    # can shift as new data accumulates.  Common choices:
+    #   "30m"  — tightest signal, highest noise; use when VIX is elevated
+    #   "1h"   — good balance for intraday sessions (current default)
+    #   "2h"   — smoother but slower to exit; better for overnight posts
     default_model_period: "1h"
+    # Confidence bonus applied when both Poly and TS signals fire in the same
+    # direction (dual_signal=True).  Added directly to the model's raw confidence.
+    # Set to 0.0 to disable.  Start conservative; revisit once you have
+    # >=50 co-occurring dual-signal events in the OOS window to validate.
+    dual_signal_confidence_bonus: 0.04
 
 tickers:
   - "SPY"

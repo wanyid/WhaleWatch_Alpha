@@ -59,6 +59,14 @@ DEAD_ZONE: dict[str, float] = {
     "1d":  0.0080,   # 0.80%
 }
 
+# Hyperparameter grid for --tune mode (27 candidates).
+TUNE_GRID = [
+    {"max_depth": d, "n_estimators": n, "learning_rate": lr}
+    for d  in [2, 3, 4]
+    for n  in [100, 200, 300]
+    for lr in [0.03, 0.05, 0.10]
+]
+
 # ---------------------------------------------------------------------------
 # Feature definitions — imported from shared module
 # ---------------------------------------------------------------------------
@@ -126,16 +134,98 @@ def _cross_validate(
     }
 
 
+def _tune_xgb_params(X: pd.DataFrame, y: pd.Series, n_folds: int = 5) -> dict:
+    """Grid search over TUNE_GRID using TimeSeriesSplit, minimising mean Brier score."""
+    from sklearn.model_selection import TimeSeriesSplit
+    from sklearn.metrics import brier_score_loss
+    from xgboost import XGBClassifier
+
+    tscv        = TimeSeriesSplit(n_splits=n_folds)
+    best_brier  = float("inf")
+    best_params = TUNE_GRID[0]
+
+    logger.info("  Tuning XGBoost: %d candidates × %d folds ...", len(TUNE_GRID), n_folds)
+
+    for params in TUNE_GRID:
+        fold_briers = []
+        for train_idx, val_idx in tscv.split(X):
+            X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
+            y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
+            if y_tr.nunique() < 2:
+                continue
+            clf = XGBClassifier(
+                **params, subsample=0.8, colsample_bytree=0.8,
+                eval_metric="logloss", random_state=42, verbosity=0,
+            )
+            clf.fit(X_tr, y_tr)
+            probs = clf.predict_proba(X_val)[:, 1]
+            fold_briers.append(float(brier_score_loss(y_val, probs)))
+
+        if not fold_briers:
+            continue
+        mean_b = float(np.mean(fold_briers))
+        if mean_b < best_brier:
+            best_brier  = mean_b
+            best_params = params
+
+    logger.info("  Best params: %s  (mean Brier=%.4f)", best_params, best_brier)
+    return best_params
+
+
+def _walk_forward(X: pd.DataFrame, y: pd.Series, n_folds: int = 5) -> pd.DataFrame:
+    """Expanding-window walk-forward: train on 0..k, test on k+1.
+
+    Diagnostic only — shows whether Brier / AUC is stable over time.
+    """
+    from sklearn.metrics import roc_auc_score, brier_score_loss
+    from xgboost import XGBClassifier
+
+    n         = len(y)
+    block     = n // (n_folds + 1)
+    rows      = []
+
+    for k in range(1, n_folds + 1):
+        tr_end  = k * block
+        val_end = min(tr_end + block, n)
+
+        X_tr, y_tr   = X.iloc[:tr_end], y.iloc[:tr_end]
+        X_val, y_val = X.iloc[tr_end:val_end], y.iloc[tr_end:val_end]
+
+        if y_tr.nunique() < 2 or y_val.nunique() < 2:
+            continue
+
+        clf = XGBClassifier(
+            n_estimators=200, max_depth=4, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8,
+            eval_metric="logloss", random_state=42, verbosity=0,
+        )
+        clf.fit(X_tr, y_tr)
+        probs = clf.predict_proba(X_val)[:, 1]
+
+        rows.append({
+            "fold":     k,
+            "train_n":  tr_end,
+            "val_n":    val_end - tr_end,
+            "pos_rate": round(float(y_val.mean()), 4),
+            "brier":    round(float(brier_score_loss(y_val, probs)), 4),
+            "auc":      round(float(roc_auc_score(y_val, probs)), 4)
+                        if y_val.nunique() > 1 else float("nan"),
+        })
+
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
 def _build_calibrated_model(
     X: pd.DataFrame,
     y: pd.Series,
     sample_weight: np.ndarray | None = None,
+    xgb_params: dict | None = None,
 ):
     """Fit XGBoost + calibration on the full training dataset.
 
     Calibration method:
-      isotonic  — flexible, but requires ~150+ samples to avoid overfitting
-      sigmoid   — stable at small N; used when n < 150
+      isotonic  — flexible, but requires ~500+ samples to avoid overfitting
+      sigmoid   — stable at small N; used when n < 500
 
     Uses TimeSeriesSplit for calibration folds so future data never contaminates
     earlier calibration folds.
@@ -147,24 +237,23 @@ def _build_calibrated_model(
     from sklearn.model_selection import TimeSeriesSplit
     from xgboost import XGBClassifier
 
-    n_pos = int(y.sum())
-    n_neg = len(y) - n_pos
-    spw   = min(n_neg / max(n_pos, 1), 5.0)   # cap at 5× to avoid extreme weighting
+    n_pos    = int(y.sum())
+    n_neg    = len(y) - n_pos
+    pos_rate = n_pos / max(len(y), 1)
+    # Only weight when imbalance is significant (outside 35–65%).
+    spw = min(n_neg / max(n_pos, 1), 5.0) if (pos_rate < 0.35 or pos_rate > 0.65) else 1.0
 
-    base = XGBClassifier(
-        n_estimators=200,
-        max_depth=4,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        scale_pos_weight=spw,
-        eval_metric="logloss",
-        random_state=42,
-        verbosity=0,
+    defaults = dict(
+        n_estimators=200, max_depth=4, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.8, scale_pos_weight=spw,
+        eval_metric="logloss", random_state=42, verbosity=0,
     )
+    if xgb_params:
+        defaults.update(xgb_params)
+    base = XGBClassifier(**defaults)
     # Isotonic calibration requires sufficient samples to avoid overfitting;
-    # sigmoid is more stable below the 150-sample threshold.
-    method = "isotonic" if len(y) >= 150 else "sigmoid"
+    # sigmoid is more stable below the 500-sample threshold.
+    method = "isotonic" if len(y) >= 500 else "sigmoid"
     clf    = CalibratedClassifierCV(base, method=method, cv=TimeSeriesSplit(n_splits=3))
     fit_kwargs = {} if sample_weight is None else {"sample_weight": sample_weight}
     clf.fit(X, y, **fit_kwargs)
@@ -240,6 +329,8 @@ def train_period(
     train_regime: bool,
     vix_threshold: float,
     decay_half: int,
+    tune: bool = False,
+    walk_forward: bool = False,
 ) -> None:
     lbl_col = f"label_{period}"
     exc_col = f"excess_ret_{period}"
@@ -292,9 +383,13 @@ def train_period(
     # subset. Use sigmoid calibration (stable at small N) since fold sizes are
     # always smaller than the full training set. scale_pos_weight is set from
     # the full-fold class ratio as a reasonable approximation.
-    n_pos_full = int(y.sum())
-    n_neg_full = len(y) - n_pos_full
-    spw_approx = min(n_neg_full / max(n_pos_full, 1), 5.0)
+    n_pos_full  = int(y.sum())
+    n_neg_full  = len(y) - n_pos_full
+    pos_rate_full = n_pos_full / max(len(y), 1)
+    spw_approx  = (
+        min(n_neg_full / max(n_pos_full, 1), 5.0)
+        if (pos_rate_full < 0.35 or pos_rate_full > 0.65) else 1.0
+    )
 
     def model_factory():
         base = XGBClassifier(
@@ -320,9 +415,18 @@ def train_period(
             logger.info("  %s: n_oos=%d  oos_pos_rate=%.1f%%",
                         period, len(y_oos_p), float(y_oos_p.mean()) * 100)
 
+    # Walk-forward stability check (diagnostic)
+    if walk_forward:
+        wf_df = _walk_forward(X, y)
+        if not wf_df.empty:
+            logger.info("  Walk-forward stability (%s):\n%s", period, wf_df.to_string(index=False))
+
+    # Optional hyperparameter tuning
+    tuned_params = _tune_xgb_params(X, y) if tune else None
+
     # --- Baseline (training data only) ---
     cv = _cross_validate(X, y, model_factory)
-    model = _build_calibrated_model(X, y)
+    model = _build_calibrated_model(X, y, xgb_params=tuned_params)
     oos_m = _oos_metrics_poly(model, X_oos_p, y_oos_p) if len(X_oos_p) > 0 else {}
     _save_model(
         model, features, period, cv, len(y), pos_rate, ret_col,
@@ -385,6 +489,8 @@ def run(
     train_regime: bool,
     vix_threshold: float,
     decay_half: int,
+    tune: bool = False,
+    walk_forward: bool = False,
 ) -> None:
     if not DATA_PATH.exists():
         logger.error("Dataset not found: %s\nRun build_poly_market_data.py first.", DATA_PATH)
@@ -429,7 +535,7 @@ def run(
     logger.info("\n--- Training ---")
     for period in HOLDING_PERIODS:
         logger.info("\nPeriod: %s", period)
-        train_period(df_train, df_oos, period, train_regime, vix_threshold, decay_half)
+        train_period(df_train, df_oos, period, train_regime, vix_threshold, decay_half, tune, walk_forward)
 
     # Summary table
     logger.info("\n--- Model summary (train cutoff: %s) ---", TRAIN_CUTOFF.date())
@@ -469,6 +575,10 @@ if __name__ == "__main__":
                         help="VIX threshold for high/low regime split (default: 20)")
     parser.add_argument("--decay-half", type=int, default=0,
                         help="Exponential decay half-life in days (0 = off; try 180)")
+    parser.add_argument("--tune", action="store_true",
+                        help="Grid-search XGBoost hyperparams before final fit (slower)")
+    parser.add_argument("--walk-forward", action="store_true",
+                        help="Print expanding-window fold stability table (diagnostic only)")
     args = parser.parse_args()
 
     run(
@@ -476,4 +586,6 @@ if __name__ == "__main__":
         train_regime=args.regime,
         vix_threshold=args.vix_threshold,
         decay_half=args.decay_half,
+        tune=args.tune,
+        walk_forward=args.walk_forward,
     )
