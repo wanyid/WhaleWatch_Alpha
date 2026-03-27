@@ -9,9 +9,13 @@ Pipeline (runs continuously):
         ↓
   RiskManager → approve / reject
         ↓
-  PaperExecutor → open position (SQLite)
+  Executor → open position  (paper: SQLite sim | alpaca: real broker)
         ↓  background sweep
-  PaperExecutor.close_expired_positions() → close + P&L
+  Executor.close_expired_positions() → close + P&L
+
+Executor is selected via settings.yaml → executor.provider:
+  "paper"  — PaperExecutor  (default, safe)
+  "alpaca" — AlpacaExecutor (requires ALPACA_API_KEY + ALPACA_SECRET_KEY)
 
 Run:
     python main.py                    # live paper-trade mode
@@ -41,6 +45,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from backtest.backtester import Backtester
+from executor.base_executor import BaseExecutor
 from executor.paper_executor import PaperExecutor
 from models.raw_events import PolymarketRawEvent, TruthSocialRawEvent
 from models.signal_event import SignalEvent
@@ -244,7 +249,7 @@ def _build_signal_event(
 def _run_poly_session_pipeline(
     session: "PolymarketSessionEvent",
     risk: RiskManager,
-    executor: PaperExecutor,
+    executor: BaseExecutor,
 ) -> Optional[str]:
     """Fast path for Polymarket session events.
 
@@ -284,7 +289,7 @@ def run_pipeline(
     l1: ClaudeLLM,
     l2: StatPredictor,
     risk: RiskManager,
-    executor: PaperExecutor,
+    executor: BaseExecutor,
     dual_companion: Optional[Union[PolymarketRawEvent, TruthSocialRawEvent]] = None,
 ) -> Optional[str]:
     """Run one Truth Social raw event through L1 → L2 → risk → execute.
@@ -359,7 +364,7 @@ def _scanner_thread(
 # Modes
 # ---------------------------------------------------------------------------
 
-def _run_true_news_check(executor: "PaperExecutor", market_provider: "YFinanceProvider") -> None:
+def _run_true_news_check(executor: BaseExecutor, market_provider: "YFinanceProvider") -> None:
     """Fetch current Polymarket prices for open positions and apply True News Stop.
 
     Queries the CLOB API for the latest price on each open position's poly_market_id.
@@ -400,13 +405,31 @@ def _run_true_news_check(executor: "PaperExecutor", market_provider: "YFinancePr
         logger.debug("_run_true_news_check error: %s", exc)
 
 
+def _build_executor(market_provider) -> BaseExecutor:
+    """Instantiate the configured executor (paper or alpaca)."""
+    try:
+        with open(_SETTINGS) as f:
+            cfg = yaml.safe_load(f) or {}
+        provider = cfg.get("executor", {}).get("provider", "paper").lower()
+    except Exception:
+        provider = "paper"
+
+    if provider == "alpaca":
+        from executor.alpaca_executor import AlpacaExecutor
+        logger.info("Executor: AlpacaExecutor")
+        return AlpacaExecutor()
+
+    logger.info("Executor: PaperExecutor")
+    return PaperExecutor(market_provider)
+
+
 def run_live(once: bool = False) -> None:
     """Live paper-trading mode."""
     market_provider = YFinanceProvider()
     l1 = ClaudeLLM()
     l2 = StatPredictor()
     risk = RiskManager()
-    executor = PaperExecutor(market_provider)
+    executor = _build_executor(market_provider)
 
     # Build scanners
     ts_user = os.getenv("TRUTHSOCIAL_USERNAME", "")
