@@ -19,6 +19,7 @@ Usage:
     python scripts/run_pipeline.py
 """
 
+import ctypes
 import subprocess
 import sys
 import os
@@ -26,6 +27,14 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+
+# Prevent Windows from sleeping while the pipeline runs.
+# ES_CONTINUOUS | ES_SYSTEM_REQUIRED tells the OS to keep the system awake.
+# Automatically reverts when this process exits — no cleanup needed.
+if sys.platform == "win32":
+    ES_CONTINUOUS = 0x80000000
+    ES_SYSTEM_REQUIRED = 0x00000001
+    ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
 
 # ---------------------------------------------------------------------------
 # Config
