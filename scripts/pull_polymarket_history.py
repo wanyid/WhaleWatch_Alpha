@@ -60,7 +60,7 @@ PRICES_DIR = POLY_DIR / "prices"
 
 DEFAULT_START   = "2024-01-01"
 DEFAULT_MIN_VOL = 50_000     # USD total volume — filters out thin markets
-CALL_SLEEP_SEC  = 0.5        # generous; Polymarket has no stated rate limit
+CALL_SLEEP_SEC  = 0.15       # Polymarket has no stated rate limit; 0.15s is safe
 
 # Polymarket CLOB prices-history rejects intervals > ~15 days with HTTP 400
 # ("interval is too long").  Previously the limit was ~28 days; it was lowered
