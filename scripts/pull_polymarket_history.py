@@ -66,6 +66,7 @@ CALL_SLEEP_SEC  = 0.15       # Polymarket has no stated rate limit; 0.15s is saf
 # ("interval is too long").  Previously the limit was ~28 days; it was lowered
 # server-side sometime before 2026-03-27.  Use 14 days for safety margin.
 CHUNK_DAYS = 14              # request window size — kept under the 15-day cap
+WORKERS    = 8               # concurrent market fetches — single fixed pool
 
 # ---------------------------------------------------------------------------
 # Topic bucket classification
@@ -272,7 +273,6 @@ def fetch_price_history_chunked(
         if not chunk.empty:
             all_dfs.append(chunk)
         t = t_end
-        time.sleep(CALL_SLEEP_SEC)
 
     if not all_dfs:
         return pd.DataFrame()
@@ -280,6 +280,74 @@ def fetch_price_history_chunked(
     combined = pd.concat(all_dfs).sort_index()
     combined = combined[~combined.index.duplicated(keep="last")]
     return combined
+
+
+# ---------------------------------------------------------------------------
+# Per-market worker (called from thread pool)
+# ---------------------------------------------------------------------------
+
+def _process_one_market(
+    row: pd.Series, start_ts: int, end_ts: int, fidelity: int, force_full: bool,
+) -> str:
+    """Fetch and save price history for one market.  Thread-safe.
+
+    Returns "ok", "skip", or "fail".
+    """
+    cid = row["condition_id"]
+    safe_id = cid.replace("0x", "")[:24]
+    out_path = PRICES_DIR / f"{safe_id}.parquet"
+
+    fetch_start = start_ts
+    market_start_str = row.get("start_date", "")
+    if market_start_str:
+        try:
+            mstart = int(
+                datetime.strptime(str(market_start_str)[:10], "%Y-%m-%d")
+                .replace(tzinfo=timezone.utc)
+                .timestamp()
+            )
+            fetch_start = max(fetch_start, mstart)
+        except Exception:
+            pass
+
+    existing = pd.DataFrame()
+    if out_path.exists() and not force_full:
+        try:
+            existing = pd.read_parquet(out_path)
+            if not existing.empty:
+                if existing.index.tz is None:
+                    existing.index = existing.index.tz_localize("UTC")
+                last_ts = int(existing.index.max().timestamp())
+                if last_ts >= end_ts - 3600:
+                    return "skip"
+                fetch_start = last_ts
+        except Exception:
+            existing = pd.DataFrame()
+
+    mkt_session = requests.Session()
+    mkt_session.headers.update({"Accept": "application/json"})
+    try:
+        new_df = fetch_price_history_chunked(
+            row["yes_token_id"], fetch_start, end_ts,
+            fidelity, CHUNK_DAYS, mkt_session,
+        )
+    except Exception as exc:
+        logger.warning("Error on market %s: %s — skipping", cid[:16], exc)
+        return "fail"
+    finally:
+        mkt_session.close()
+
+    if new_df.empty:
+        return "fail"
+
+    if not existing.empty:
+        combined = pd.concat([existing, new_df]).sort_index()
+        combined = combined[~combined.index.duplicated(keep="last")]
+    else:
+        combined = new_df
+
+    combined.to_parquet(out_path)
+    return "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -333,23 +401,17 @@ def run(start: str, min_volume: float, force_full: bool, fidelity: int = 60,
     for bucket, count in meta_df["topic_bucket"].value_counts().items():
         logger.info("  %-14s  %d markets", bucket, count)
 
-    # Pull price history for each market.
-    # Design: each market gets its own isolated requests.Session.
-    # This eliminates TCP connection-pool exhaustion — the root cause of silent
-    # hangs that previously occurred around market #650+.
-    #
-    # On Windows, requests.get(timeout=...) occasionally hangs on specific markets
-    # (zombie TCP state). The external watchdog kills and restarts the process.
-    # To avoid re-hanging on the SAME market, we write a progress marker before
-    # each fetch. On --use-cached-catalog restarts, markets up to the marker are
-    # skipped (they either already have files or were the one that caused the hang).
+    # Pull price history concurrently.
+    # A single ThreadPoolExecutor with WORKERS threads processes all markets.
+    # Unlike the old per-market executor approach (which accumulated 700+ zombie
+    # threads), one fixed pool is clean, bounded, and shuts down properly.
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     n_ok = n_skip = n_fail = 0
     total = len(meta_df)
     LOG_EVERY = 10
 
-    # Progress marker: records the last market idx that was ATTEMPTED.
-    # On restart after a watchdog kill, skip to marker+1 so we don't re-hang
-    # on the same problematic market.
+    # Progress marker: updated as markets complete for watchdog liveness.
     progress_path = POLY_DIR / ".pull_progress"
     resume_from = 0
     if use_cached_catalog and progress_path.exists():
@@ -359,90 +421,51 @@ def run(start: str, min_volume: float, force_full: bool, fidelity: int = 60,
         except Exception:
             resume_from = 0
 
+    # Build work list — skip markets already handled in a prior run
+    work_items = []
     for idx, (_, row) in enumerate(meta_df.iterrows(), 1):
-        # Skip markets already attempted in a previous run (before watchdog kill)
         if idx <= resume_from:
             cid = row["condition_id"]
             safe_id = cid.replace("0x", "")[:24]
-            out_path = PRICES_DIR / f"{safe_id}.parquet"
-            if out_path.exists():
+            if (PRICES_DIR / f"{safe_id}.parquet").exists():
                 n_skip += 1
             else:
-                n_fail += 1  # was attempted but never saved → skip it
+                n_fail += 1
             continue
+        work_items.append((idx, row))
 
-        cid       = row["condition_id"]
-        safe_id   = cid.replace("0x", "")[:24]
-        out_path  = PRICES_DIR / f"{safe_id}.parquet"
+    logger.info("Work queue: %d markets to process (%d pre-skipped, %d pre-failed)",
+                len(work_items), n_skip, n_fail)
 
-        # Resume: only fetch bars newer than last saved bar
-        fetch_start = start_ts
-        existing    = pd.DataFrame()
-
-        # Clamp fetch_start to the market's known start_date to skip pre-creation chunks.
-        market_start_str = row.get("start_date", "")
-        if market_start_str:
+    completed = 0
+    with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+        futures = {
+            executor.submit(_process_one_market, row, start_ts, end_ts, fidelity, force_full): idx
+            for idx, row in work_items
+        }
+        for future in as_completed(futures):
+            idx = futures[future]
+            completed += 1
             try:
-                mstart = int(
-                    datetime.strptime(str(market_start_str)[:10], "%Y-%m-%d")
-                    .replace(tzinfo=timezone.utc)
-                    .timestamp()
+                result = future.result()
+            except Exception:
+                result = "fail"
+
+            if result == "ok":
+                n_ok += 1
+            elif result == "skip":
+                n_skip += 1
+            else:
+                n_fail += 1
+
+            # Update progress marker — watchdog monitors mtime for liveness
+            progress_path.write_text(str(idx))
+
+            if completed % LOG_EVERY == 0 or completed == len(work_items):
+                logger.info(
+                    "[%d/%d]  pulled=%d  skipped=%d  failed=%d",
+                    completed + resume_from, total, n_ok, n_skip, n_fail,
                 )
-                fetch_start = max(fetch_start, mstart)
-            except Exception:
-                pass
-
-        if out_path.exists() and not force_full:
-            try:
-                existing = pd.read_parquet(out_path)
-                if not existing.empty:
-                    if existing.index.tz is None:
-                        existing.index = existing.index.tz_localize("UTC")
-                    last_ts = int(existing.index.max().timestamp())
-                    if last_ts >= end_ts - 3600:
-                        n_skip += 1
-                        continue
-                    fetch_start = last_ts
-            except Exception:
-                existing = pd.DataFrame()
-
-        # Write progress marker BEFORE fetch — if we hang here, the watchdog
-        # kills us and on restart we skip past this market.
-        progress_path.write_text(str(idx))
-
-        # Each market gets a dedicated session — isolated TCP pool, no shared state.
-        mkt_session = requests.Session()
-        mkt_session.headers.update({"Accept": "application/json"})
-        try:
-            new_df = fetch_price_history_chunked(
-                row["yes_token_id"], fetch_start, end_ts,
-                fidelity, CHUNK_DAYS, mkt_session,
-            )
-        except Exception as exc:
-            logger.warning("Error on market %s: %s — skipping", cid[:16], exc)
-            n_fail += 1
-            continue
-        finally:
-            mkt_session.close()
-
-        if new_df.empty:
-            n_fail += 1
-            continue
-
-        if not existing.empty:
-            combined = pd.concat([existing, new_df]).sort_index()
-            combined = combined[~combined.index.duplicated(keep="last")]
-        else:
-            combined = new_df
-
-        combined.to_parquet(out_path)
-        n_ok += 1
-
-        if idx % LOG_EVERY == 0 or idx == total:
-            logger.info(
-                "[%d/%d]  pulled=%d  skipped=%d  failed=%d",
-                idx, total, n_ok, n_skip, n_fail,
-            )
 
     # Clean up progress marker on successful completion
     try:
