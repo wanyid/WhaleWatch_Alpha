@@ -55,7 +55,7 @@ DATA_PATH  = Path("D:/WhaleWatch_Data/poly_market_data.parquet")
 MODELS_DIR = PROJECT_ROOT / "models" / "saved"
 
 # Train / OOS split — same cutoff as directional model
-TRAIN_CUTOFF = pd.Timestamp("2026-02-28")
+TRAIN_CUTOFF = pd.Timestamp("2026-02-28", tz="UTC")
 
 # Fade-specific holding periods (must be longer than FADE_ENTRY_LAG=30m)
 FADE_PERIODS = ["2h", "4h", "1d"]
@@ -163,8 +163,15 @@ def _build_calibrated_model(
         random_state=42,
         verbosity=0,
     )
-    method = "isotonic" if len(y) >= 500 else "sigmoid"
-    clf    = CalibratedClassifierCV(base, method=method, cv=TimeSeriesSplit(n_splits=3))
+    method    = "isotonic" if len(y) >= 500 else "sigmoid"
+    minority  = min(n_pos, n_neg)
+    # Need at least 2 minority-class samples per fold for calibration CV
+    n_splits  = max(2, min(3, minority // 2))
+    if minority < 4:
+        # Too few minority samples for inner CV — skip calibration wrapper
+        base.fit(X, y, **({} if sample_weight is None else {"sample_weight": sample_weight}))
+        return base
+    clf    = CalibratedClassifierCV(base, method=method, cv=TimeSeriesSplit(n_splits=n_splits))
     fit_kw = {} if sample_weight is None else {"sample_weight": sample_weight}
     clf.fit(X, y, **fit_kw)
     return clf
@@ -304,14 +311,15 @@ def train_period(
         period, len(y), pos_rate * 100, n_pos, n_neg,
     )
 
+    # For CV evaluation, use plain XGBClassifier (no calibration wrapper) —
+    # CalibratedClassifierCV's inner CV fails on small minority-class folds.
     def model_factory():
-        base = XGBClassifier(
+        return XGBClassifier(
             n_estimators=200, max_depth=3, learning_rate=0.05,
             subsample=0.8, colsample_bytree=0.8,
             scale_pos_weight=spw_approx,
             eval_metric="logloss", random_state=42, verbosity=0,
         )
-        return CalibratedClassifierCV(base, method="sigmoid", cv=TimeSeriesSplit(n_splits=3))
 
     cv = _cross_validate(X, y, model_factory)
     logger.info("  %s: CV  auc=%.3f  acc=%.3f  folds=%d",

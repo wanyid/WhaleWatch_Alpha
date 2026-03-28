@@ -50,11 +50,36 @@ REGIME_FEATURES = [
     "day_of_week",
 ]
 
-# Canonical order for directional model (24 features total)
+# SPY context at session time — what equity is doing when signal fires
+SPY_CONTEXT_FEATURES = [
+    "spy_ret_1h",              # SPY return over prior 1h (momentum)
+    "spy_ret_4h",              # SPY return over prior 4h (trend)
+    "spy_range_pct",           # intraday high-low / open (extension)
+    "spy_dist_from_open_pct",  # (close - open) / open (intraday bias)
+]
+
+# Market quality — not all Polymarket markets are equal
+MARKET_QUALITY_FEATURES = [
+    "avg_market_volume",       # mean lifetime USD volume of markets in session
+    "max_market_volume",       # largest market in session by volume
+    "avg_market_age_days",     # mean age of markets in session
+]
+
+# Cross-market momentum + session clustering
+MOMENTUM_FEATURES = [
+    "sessions_last_24h",       # number of sessions in prior 24h (activity burst)
+    "cumulative_delta_24h",    # net delta across all sessions in prior 24h
+    "hours_since_last_session", # recency — lower = cluster, higher = isolated signal
+]
+
+# Canonical order for directional model (34 features total)
 ALL_DIRECTIONAL_FEATURES = (
     STRENGTH_FEATURES
     + TOPIC_FEATURES
     + REGIME_FEATURES
+    + SPY_CONTEXT_FEATURES
+    + MARKET_QUALITY_FEATURES
+    + MOMENTUM_FEATURES
 )
 
 # ---------------------------------------------------------------------------
@@ -68,5 +93,5 @@ FADE_FEATURES = [
     "abs_initial_ret",    # magnitude alone
 ]
 
-# Full feature set for fade model (27 features total)
+# Full feature set for fade model (37 features total)
 ALL_FADE_FEATURES = ALL_DIRECTIONAL_FEATURES + FADE_FEATURES

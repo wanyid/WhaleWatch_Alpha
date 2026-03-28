@@ -23,9 +23,16 @@ import sys
 
 import numpy as np
 import pandas as pd
+import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+# Load data_start_date from settings
+_settings_path = PROJECT_ROOT / "config" / "settings.yaml"
+with open(_settings_path) as _f:
+    _cfg = yaml.safe_load(_f)
+DATA_START_DATE = pd.Timestamp(_cfg["data"]["data_start_date"], tz="UTC")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -133,6 +140,18 @@ def load_spy_prices() -> tuple[pd.DataFrame, pd.DataFrame]:
 
     spy_5m = _load([EQUITY_DIR / "SPY_5m_poly.parquet", EQUITY_DIR / "SPY_5m_recent.parquet"])
     spy_1h = _load([EQUITY_DIR / "SPY_1h_poly.parquet", EQUITY_DIR / "SPY_1h.parquet"])
+
+    # Ensure true 1h bars — some sources deliver mixed 30m/1h intervals.
+    # Resample from 5m if available (more precise); otherwise OHLCV-aggregate the 1h file.
+    if not spy_5m.empty:
+        spy_1h = spy_5m.resample("1h").agg(
+            {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+        ).dropna(subset=["close"])
+    elif not spy_1h.empty:
+        spy_1h = spy_1h.resample("1h").agg(
+            {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+        ).dropna(subset=["close"])
+
     return spy_5m, spy_1h
 
 
@@ -148,7 +167,11 @@ def load_vixy_prices() -> pd.DataFrame:
 
 
 def load_vix_data() -> tuple[pd.Series, pd.Series]:
-    """Load VIX daily close and rolling percentile via yfinance."""
+    """Load VIX daily close and rolling percentile via yfinance.
+
+    Percentile uses shift(1) before ranking so the current day's VIX
+    is not included in its own percentile calculation (no lookahead).
+    """
     import yfinance as yf
     raw = yf.download("^VIX", start="2023-01-01", progress=False, auto_adjust=True)
     if isinstance(raw.columns, pd.MultiIndex):
@@ -156,8 +179,28 @@ def load_vix_data() -> tuple[pd.Series, pd.Series]:
     vix = raw["Close"].squeeze()
     if vix.index.tz is None:
         vix.index = vix.index.tz_localize("UTC")
-    vix_pct = vix.rolling(252, min_periods=60).rank(pct=True)
+    # shift(1) prevents lookahead: today's rank uses only prior closes
+    vix_pct = vix.shift(1).rolling(252, min_periods=60).rank(pct=True)
     return vix, vix_pct
+
+
+# ---------------------------------------------------------------------------
+# Step 0.5 — Price-derived activity proxy
+# ---------------------------------------------------------------------------
+
+def compute_price_activity(price_series: pd.Series) -> pd.Series:
+    """Derive an hourly activity series from price data.
+
+    Computes |price_change| per bar, which is a proxy for trading activity:
+    hours with large price moves indicate more trading.  This replaces the
+    CLOB trades-based USDC volume (no longer publicly available) while
+    preserving the same spike-detection logic downstream.
+
+    Returns a Series with the same index as the input, values = abs(Δprice).
+    """
+    activity = price_series.diff().abs()
+    activity.iloc[0] = 0.0  # first bar has no diff
+    return activity
 
 
 # ---------------------------------------------------------------------------
@@ -169,15 +212,20 @@ def detect_anomalies(
     condition_id: str,
     meta_row: pd.Series,
     volume_series: pd.Series | None = None,
+    activity_series: pd.Series | None = None,
 ) -> pd.DataFrame:
     """Return one row per anomaly event in a market's price history.
 
     An anomaly is a |YES-price delta| >= PRICE_DELTA_THRESHOLD over the
     last ROLLING_WINDOW bars (i.e., a sustained directional move).
 
-    If volume_series is provided, also computes volume_spike_pct at each
-    anomaly timestamp (% above rolling average). This identifies whale-size
-    trades: price move + volume spike = high-confidence informed bet.
+    Activity/volume spike:
+      1. If volume_series is provided (real USDC volume), use it.
+      2. Otherwise fall back to activity_series (price-derived proxy).
+      3. If neither is available, volume_spike_pct = 0.
+
+    The spike metric is always: % above rolling baseline — whether the
+    underlying data is real volume or price activity.
     """
     if len(price_series) < ROLLING_WINDOW + 1:
         return pd.DataFrame()
@@ -190,23 +238,28 @@ def detect_anomalies(
     if events.empty:
         return pd.DataFrame()
 
-    # Pre-compute volume spike % at each hour (NaN if no volume data)
-    vol_spike_map: dict = {}
+    # Select the best available activity signal
+    # Prefer real volume; fall back to price-derived activity proxy
+    act_series = None
     if volume_series is not None and len(volume_series) >= 3:
+        act_series = volume_series
+    elif activity_series is not None and len(activity_series) >= 3:
+        act_series = activity_series
+
+    # Pre-compute spike % at each anomaly timestamp
+    spike_map: dict = {}
+    if act_series is not None:
         # Rolling baseline excludes current bar (shift(1) then rolling mean)
-        vol_baseline = volume_series.shift(1).rolling(VOLUME_ROLLING_WINDOW, min_periods=3).mean()
+        baseline = act_series.shift(1).rolling(VOLUME_ROLLING_WINDOW, min_periods=3).mean()
         for ts in events.index:
-            # Find the hourly volume bar matching this timestamp (floor to hour)
             bar = ts.floor("1h")
-            if bar in volume_series.index and bar in vol_baseline.index:
-                baseline = vol_baseline.loc[bar]
-                vol      = volume_series.loc[bar]
-                if pd.notna(baseline) and baseline > 0:
-                    vol_spike_map[ts] = ((vol - baseline) / baseline) * 100.0
+            if bar in act_series.index and bar in baseline.index:
+                bl = baseline.loc[bar]
+                val = act_series.loc[bar]
+                if pd.notna(bl) and bl > 0:
+                    spike_map[ts] = ((val - bl) / bl) * 100.0
                 else:
-                    vol_spike_map[ts] = 0.0
-            else:
-                vol_spike_map[ts] = None   # volume data absent for this bar
+                    spike_map[ts] = 0.0
 
     rows = []
     for ts, d in events.items():
@@ -218,7 +271,7 @@ def detect_anomalies(
             "price_before":    float(lagged.loc[ts]),
             "price_after":     float(price_series.loc[ts]),
             "price_delta":     float(d),
-            "volume_spike_pct": vol_spike_map.get(ts),   # None if no volume data
+            "volume_spike_pct": spike_map.get(ts, 0.0),
         })
     return pd.DataFrame(rows)
 
@@ -230,6 +283,7 @@ def detect_anomalies(
 def build_sessions(
     anomalies: pd.DataFrame,
     session_window_min: int,
+    meta: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Group anomaly events within session_window_min into signal sessions.
 
@@ -245,6 +299,21 @@ def build_sessions(
         return pd.DataFrame()
 
     anomalies = anomalies.sort_values("event_time").reset_index(drop=True)
+
+    # Pre-build market quality lookup from metadata
+    vol_lookup: dict[str, float] = {}
+    start_lookup: dict[str, pd.Timestamp] = {}   # store start_date, compute age per-session
+    if meta is not None:
+        for _, row in meta.iterrows():
+            cid = row["condition_id"]
+            vol_lookup[cid] = float(row.get("volume", 0) or 0)
+            start_str = str(row.get("start_date", ""))[:10]
+            if start_str and start_str != "nan":
+                try:
+                    start_lookup[cid] = pd.Timestamp(start_str, tz="UTC")
+                except Exception:
+                    pass
+
     sessions  = []
     i = 0
 
@@ -271,12 +340,20 @@ def build_sessions(
             else 0.0
         )
 
-        # Volume spike aggregation (NaN where volume data is absent)
-        vol_col = events["volume_spike_pct"].dropna() if "volume_spike_pct" in events.columns else pd.Series(dtype=float)
-        max_vol_spike  = float(vol_col.max())     if not vol_col.empty else None
-        avg_vol_spike  = float(vol_col.mean())    if not vol_col.empty else None
-        # n_volume_spikes: events where both price AND volume anomaly fired
-        n_vol_spikes   = int((vol_col >= VOLUME_SPIKE_THRESHOLD).sum()) if not vol_col.empty else 0
+        # Volume spike aggregation — NaN → 0 for explicit imputation
+        vol_col = events["volume_spike_pct"].fillna(0.0) if "volume_spike_pct" in events.columns else pd.Series([0.0])
+        max_vol_spike  = float(vol_col.max())
+        avg_vol_spike  = float(vol_col.mean())
+        n_vol_spikes   = int((vol_col >= VOLUME_SPIKE_THRESHOLD).sum())
+
+        # Market quality features — volume and age of markets in this session
+        # Age is computed relative to session time (not build time) to avoid lookahead
+        session_cids = events["condition_id"].unique()
+        mkt_vols = [vol_lookup.get(c, 0) for c in session_cids]
+        mkt_ages = [
+            max((anchor_time - start_lookup[c]).days, 0)
+            for c in session_cids if c in start_lookup
+        ]
 
         sessions.append({
             "session_time":           anchor_time,
@@ -292,16 +369,20 @@ def build_sessions(
             "n_opposing":             len(opp_dir),
             "corroboration_ratio":    len(same_dir) / max(len(events), 1),
             "session_duration_min":   duration_min,
-            # Volume spike features — whale bet size signal
-            "max_volume_spike_pct":   max_vol_spike,   # None if volume data unavailable
+            # Volume spike features — imputed to 0 when volume data absent
+            "max_volume_spike_pct":   max_vol_spike,
             "avg_volume_spike_pct":   avg_vol_spike,
-            "n_volume_spikes":        n_vol_spikes,    # events with price + volume anomaly
+            "n_volume_spikes":        n_vol_spikes,
             # Topic flags (one-hot, non-exclusive)
             "has_tariff":             int((events["topic_bucket"] == "tariff").any()),
             "has_geopolitical":       int((events["topic_bucket"] == "geopolitical").any()),
             "has_fed":                int((events["topic_bucket"] == "fed").any()),
             "has_energy":             int((events["topic_bucket"] == "energy").any()),
             "has_executive":          int((events["topic_bucket"] == "executive").any()),
+            # Market quality features
+            "avg_market_volume":      float(np.mean(mkt_vols)) if mkt_vols else 0.0,
+            "max_market_volume":      float(np.max(mkt_vols)) if mkt_vols else 0.0,
+            "avg_market_age_days":    float(np.mean(mkt_ages)) if mkt_ages else 0.0,
         })
 
         # Advance past the current window
@@ -324,6 +405,129 @@ def add_temporal_features(sessions: pd.DataFrame) -> pd.DataFrame:
         (local.dt.hour < 16) &
         (local.dt.dayofweek < 5)
     ).astype(int)
+    return sessions
+
+
+def add_spy_context_features(
+    sessions: pd.DataFrame,
+    spy_5m: pd.DataFrame,
+) -> pd.DataFrame:
+    """Add SPY price context at session time — what the equity market is doing.
+
+    Features:
+      spy_ret_1h:             SPY return over prior 1h (short-term momentum)
+      spy_ret_4h:             SPY return over prior 4h (trend)
+      spy_range_pct:          intraday (high - low) / open (extension)
+      spy_dist_from_open_pct: (last close - day open) / day open (intraday bias)
+
+    All use strictly past data (no lookahead): the bar AT session_time is
+    excluded (< ts, not <= ts) to avoid including concurrent market activity.
+
+    Uses merge_asof for O(n log m) instead of per-row O(n × m).
+    """
+    ctx_cols = ["spy_ret_1h", "spy_ret_4h", "spy_range_pct", "spy_dist_from_open_pct"]
+    if spy_5m.empty:
+        for col in ctx_cols:
+            sessions[col] = np.nan
+        return sessions
+
+    spy = spy_5m.copy()
+    spy.index.name = "bar_time"
+
+    # Pre-compute 1h and 4h lagged closes using shift (strictly past)
+    # shift(12) = 12 bars × 5min = 1h ago; shift(48) = 4h ago
+    spy["close_1h_ago"] = spy["close"].shift(12)
+    spy["close_4h_ago"] = spy["close"].shift(48)
+
+    # NY calendar date for intraday features
+    spy_ny = spy.index.tz_convert("America/New_York")
+    spy["ny_date"] = spy_ny.date
+
+    # Cumulative intraday high/low/open per NY day (strictly expanding)
+    spy["day_open"]     = spy.groupby("ny_date")["open"].transform("first")
+    spy["day_high_cum"] = spy.groupby("ny_date")["high"].cummax()
+    spy["day_low_cum"]  = spy.groupby("ny_date")["low"].cummin()
+
+    # Build a lookup frame with one row per 5m bar
+    spy_ctx = spy[["close", "close_1h_ago", "close_4h_ago",
+                   "day_open", "day_high_cum", "day_low_cum"]].copy()
+    spy_ctx = spy_ctx.reset_index()
+
+    # Prepare session keys for merge_asof (strict past: use the bar BEFORE session_time)
+    sess_keys = sessions[["session_time"]].copy()
+    sess_keys["_idx"] = sess_keys.index
+    sess_keys = sess_keys.sort_values("session_time")
+
+    # merge_asof: find the most recent bar strictly before session_time
+    merged = pd.merge_asof(
+        sess_keys,
+        spy_ctx,
+        left_on="session_time",
+        right_on="bar_time",
+        direction="backward",
+        tolerance=pd.Timedelta(hours=18),  # reject if no bar within 18h
+    )
+
+    # Compute features from the merged bar
+    c      = merged["close"]
+    c_1h   = merged["close_1h_ago"]
+    c_4h   = merged["close_4h_ago"]
+    d_open = merged["day_open"]
+    d_high = merged["day_high_cum"]
+    d_low  = merged["day_low_cum"]
+
+    merged["spy_ret_1h"]             = (c - c_1h) / c_1h
+    merged["spy_ret_4h"]             = (c - c_4h) / c_4h
+    merged["spy_range_pct"]          = np.where(d_open > 0, (d_high - d_low) / d_open, np.nan)
+    merged["spy_dist_from_open_pct"] = np.where(d_open > 0, (c - d_open) / d_open, np.nan)
+
+    # Restore original order and assign
+    merged = merged.sort_values("_idx")
+    for col in ctx_cols:
+        sessions[col] = merged[col].values
+
+    return sessions
+
+
+def add_momentum_features(sessions: pd.DataFrame) -> pd.DataFrame:
+    """Add cross-session momentum and clustering features.
+
+    Uses only strictly past sessions (shift-safe via chronological sort).
+
+    Features:
+      sessions_last_24h:        count of sessions in the 24h before this session
+      cumulative_delta_24h:     net cumulative_delta across those prior sessions
+      hours_since_last_session: hours since the immediately preceding session
+    """
+    if sessions.empty:
+        return sessions
+
+    sessions = sessions.sort_values("session_time").reset_index(drop=True)
+    times   = sessions["session_time"].values    # numpy datetime64
+    deltas  = sessions["cumulative_delta"].values
+
+    s24h  = []
+    cd24h = []
+    hours_since = []
+
+    for i in range(len(sessions)):
+        ts_i = times[i]
+        ts_24h_ago = ts_i - np.timedelta64(24, "h")
+
+        # Look only at strictly prior sessions (j < i)
+        prior_mask = (times[:i] > ts_24h_ago) & (times[:i] < ts_i)
+        s24h.append(int(prior_mask.sum()))
+        cd24h.append(float(deltas[:i][prior_mask].sum()) if prior_mask.any() else 0.0)
+
+        if i > 0:
+            hrs = (ts_i - times[i - 1]) / np.timedelta64(1, "h")
+            hours_since.append(float(hrs))
+        else:
+            hours_since.append(np.nan)
+
+    sessions["sessions_last_24h"]        = s24h
+    sessions["cumulative_delta_24h"]     = cd24h
+    sessions["hours_since_last_session"] = hours_since
     return sessions
 
 
@@ -356,9 +560,20 @@ def add_vix_features(
 # Step 4 — SPY forward returns
 # ---------------------------------------------------------------------------
 
-def _next_bar(ts: pd.Timestamp, spy: pd.DataFrame) -> pd.Timestamp | None:
+def _next_bar(ts: pd.Timestamp, spy: pd.DataFrame,
+              max_gap_hours: float = 18) -> pd.Timestamp | None:
+    """Find the first SPY bar >= ts, rejecting if the gap exceeds max_gap_hours.
+
+    A large gap means the session predates the available SPY data or falls on
+    a long holiday — either way the matched bar does not represent a real fill.
+    """
     future = spy.index[spy.index >= ts]
-    return future[0] if len(future) > 0 else None
+    if len(future) == 0:
+        return None
+    bar = future[0]
+    if (bar - ts).total_seconds() / 3600 > max_gap_hours:
+        return None
+    return bar
 
 
 def compute_spy_returns(
@@ -387,7 +602,7 @@ def compute_spy_returns(
             # Wait for the session window to close before entering
             entry_ts  = ts + pd.Timedelta(minutes=session_window_min)
             entry_bar = _next_bar(entry_ts, spy)
-            if entry_bar is None or entry_bar < spy.index[0]:
+            if entry_bar is None:
                 returns.append(None)
                 continue
 
@@ -411,22 +626,29 @@ def compute_spy_returns(
 # ---------------------------------------------------------------------------
 
 def add_excess_labels(sessions: pd.DataFrame) -> pd.DataFrame:
-    """Compute rolling excess returns and raw-return direction labels.
+    """Compute rolling excess returns and signal-relative direction labels.
 
     Two things happen here:
       1. excess_ret_* columns are computed and stored for exploration and the
          fade model (not used to define training labels).
-      2. label_* = sign of the RAW return (1 = SPY up, 0 = SPY down).
+      2. label_* = signal-relative label: 1 if SPY moved in the direction the
+         whale signal predicted, 0 otherwise.
 
-    Using raw returns for labels avoids the rolling-baseline absorption
-    problem: if signals cluster in time the rolling mean partially cancels the
-    very signal it should be measuring.  The dead zone (filter on |raw_ret|)
-    is applied at training time so thresholds can be changed without a rebuild.
+         Specifically: label = int(dominant_direction * raw_ret > 0).
+         - dominant_direction = +1 when Polymarket YES prices are rising
+           (bullish signal → expect SPY up)
+         - dominant_direction = -1 when YES prices are falling
+           (bearish signal → expect SPY down)
+
+         This directly answers "should I follow this signal?" rather than
+         the weaker question "will SPY go up?"
 
     Rolling baseline notes:
       - shift(1) ensures no lookahead: row i's baseline uses sessions 0..i-1
       - excess_ret_* are informational; they are NOT in the model feature set
     """
+    dom_dir = sessions["dominant_direction"]
+
     for period_name in HOLDING_PERIODS:
         ret_col   = f"ret_{period_name}"
         ex_col    = f"excess_ret_{period_name}"
@@ -441,10 +663,11 @@ def add_excess_labels(sessions: pd.DataFrame) -> pd.DataFrame:
         ).mean()
         sessions[ex_col] = sessions[ret_col] - baseline
 
-        # Label = sign of raw return; NaN only where ret is NaN
+        # Signal-relative label: did SPY move in the whale-signal direction?
+        # dominant_direction * ret > 0 means the whale signal was correct.
         sessions[lbl_col] = np.where(
             sessions[ret_col].notna(),
-            (sessions[ret_col] > 0).astype(int),
+            (dom_dir * sessions[ret_col] > 0).astype(int),
             np.nan,
         )
 
@@ -527,23 +750,36 @@ def run(session_window_min: int, price_delta: float) -> None:
 
     # Detect anomalies for every market
     all_anomalies: list[pd.DataFrame] = []
-    n_loaded = n_with_volume = 0
+    n_loaded = n_with_volume = n_with_activity = 0
     for _, row in meta.iterrows():
         prices = load_price_file(row["condition_id"])
         if prices.empty:
             continue
+
+        # Prefer real USDC volume; fall back to price-derived activity proxy
         volume = load_volume_file(row["condition_id"])
+        activity = None
         if not volume.empty:
             n_with_volume += 1
+        else:
+            # Compute price-activity proxy from the hourly price data
+            activity = compute_price_activity(prices["price"])
+            if len(activity) >= 3:
+                n_with_activity += 1
+
         anomalies = detect_anomalies(
             prices["price"], row["condition_id"], row,
             volume_series=volume if not volume.empty else None,
+            activity_series=activity,
         )
         if not anomalies.empty:
             all_anomalies.append(anomalies)
             n_loaded += 1
 
-    logger.info("  %d/%d markets have volume data", n_with_volume, n_loaded)
+    logger.info(
+        "  %d/%d markets: %d with real volume, %d with price-activity proxy",
+        n_loaded, len(meta), n_with_volume, n_with_activity,
+    )
 
     if not all_anomalies:
         logger.error("No anomaly events detected. Run pull_polymarket_history.py first.")
@@ -559,20 +795,33 @@ def run(session_window_min: int, price_delta: float) -> None:
     for bucket, cnt in anomalies_df["topic_bucket"].value_counts().items():
         logger.info("  %-14s  %d events", bucket, cnt)
 
-    # Build sessions
+    # Build sessions (pass meta for market quality features)
     logger.info("Building sessions (window=%d min)...", session_window_min)
-    sessions = build_sessions(anomalies_df, session_window_min)
-    logger.info("  %d sessions", len(sessions))
+    sessions = build_sessions(anomalies_df, session_window_min, meta=meta)
+    logger.info("  %d sessions (all dates)", len(sessions))
+
+    # Filter to data_start_date — pre-regime sessions lack SPY coverage and
+    # mix in market dynamics from a different presidential term
+    n_before = len(sessions)
+    sessions = sessions[sessions["session_time"] >= DATA_START_DATE].reset_index(drop=True)
+    logger.info("  %d sessions after data_start_date filter (%s) — dropped %d",
+                len(sessions), DATA_START_DATE.date(), n_before - len(sessions))
 
     # Feature engineering
     sessions = add_temporal_features(sessions)
     sessions = add_vix_features(sessions, vix_close, vix_pct, vixy_5m)
 
+    logger.info("Computing SPY context features at session time...")
+    sessions = add_spy_context_features(sessions, spy_5m)
+
+    logger.info("Computing cross-session momentum features...")
+    sessions = add_momentum_features(sessions)
+
     # SPY returns (entry anchored at T + session_window_min)
     logger.info("Computing SPY forward returns (entry at T+%dmin)...", session_window_min)
     sessions = compute_spy_returns(sessions, spy_5m, spy_1h, session_window_min)
 
-    # Directional labels (raw return)
+    # Signal-relative labels: P(whale signal direction was correct)
     sessions = add_excess_labels(sessions)
 
     # Fade labels (continuation return after initial move)
@@ -585,8 +834,8 @@ def run(session_window_min: int, price_delta: float) -> None:
     sessions.to_parquet(OUT_PATH)
     logger.info("Saved %d sessions → %s", len(sessions), OUT_PATH)
 
-    # Summary — directional labels
-    logger.info("\n--- Directional label summary ---")
+    # Summary — directional labels (signal-relative: P(whale signal correct))
+    logger.info("\n--- Directional label summary (signal-relative) ---")
     for period_name in HOLDING_PERIODS:
         lbl_col = f"label_{period_name}"
         if lbl_col not in sessions.columns:
@@ -594,7 +843,7 @@ def run(session_window_min: int, price_delta: float) -> None:
         valid = sessions[lbl_col].dropna()
         if len(valid) > 0:
             logger.info(
-                "  %-4s  n=%4d  pos_rate=%.1f%%",
+                "  %-4s  n=%4d  signal_correct=%.1f%%",
                 period_name, len(valid), valid.mean() * 100,
             )
         else:

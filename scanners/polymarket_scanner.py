@@ -30,6 +30,9 @@ from models.raw_events import PolymarketRawEvent
 from reasoner.layer2_predictor.poly_features import ALL_DIRECTIONAL_FEATURES as _POLY_FEATURES
 from scanners.base_scanner import BaseScanner
 
+# Market metadata for quality features (loaded once)
+_MARKET_META_PATH = Path("D:/WhaleWatch_Data/polymarket/market_meta.parquet")
+
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -147,6 +150,7 @@ class SessionManager:
                              should refresh this periodically).
         vix_percentile:      Current VIX percentile (0–1).
         model_period:        Which holding period model to use (e.g. "1h").
+                             Pass "ensemble" to use the multi-period ensemble.
     """
 
     def __init__(
@@ -170,8 +174,84 @@ class SessionManager:
         self._last_event_time: Optional[datetime]           = None
         self._model:      Optional[object]                  = None
         self._features:   Optional[List[str]]               = None
+        self._ensemble:   Optional[dict]                    = None
 
-        self._load_model(model_period)
+        # SPY context: injected by caller (main.py), refreshed periodically
+        self._spy_ret_1h:             float = 0.0
+        self._spy_ret_4h:             float = 0.0
+        self._spy_range_pct:          float = 0.0
+        self._spy_dist_from_open_pct: float = 0.0
+
+        # Session history for momentum features (ring buffer of recent sessions)
+        # Persisted to disk so momentum features survive scanner restarts.
+        self._session_history: Deque[tuple[datetime, float]] = deque(maxlen=200)
+        self._history_path = MODELS_DIR / "session_history.json"
+        self._load_session_history()
+
+        # Market quality lookup from metadata
+        self._market_vol:  Dict[str, float] = {}
+        self._market_age:  Dict[str, float] = {}
+        self._load_market_meta()
+
+        if model_period == "ensemble":
+            self._load_ensemble()
+        else:
+            self._load_model(model_period)
+
+    def _load_market_meta(self) -> None:
+        """Load market volume/age from metadata for quality features."""
+        if not _MARKET_META_PATH.exists():
+            logger.info("SessionManager: market_meta.parquet not found — market quality features will be 0")
+            return
+        try:
+            meta = pd.read_parquet(_MARKET_META_PATH)
+            now = datetime.now(tz=timezone.utc)
+            for _, row in meta.iterrows():
+                cid = row["condition_id"]
+                self._market_vol[cid] = float(row.get("volume", 0) or 0)
+                start_str = str(row.get("start_date", ""))[:10]
+                if start_str and start_str != "nan":
+                    try:
+                        mstart = datetime.strptime(start_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                        self._market_age[cid] = max((now - mstart).days, 0)
+                    except Exception:
+                        pass
+            logger.info("SessionManager: loaded market quality data for %d markets", len(self._market_vol))
+        except Exception as exc:
+            logger.warning("SessionManager: failed to load market_meta: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Session history persistence
+    # ------------------------------------------------------------------
+
+    def _load_session_history(self) -> None:
+        """Restore session history from disk for momentum feature continuity."""
+        import json
+        if not self._history_path.exists():
+            return
+        try:
+            with open(self._history_path) as f:
+                entries = json.load(f)
+            for entry in entries:
+                ts = datetime.fromisoformat(entry["ts"])
+                delta = float(entry["delta"])
+                self._session_history.append((ts, delta))
+            logger.info("SessionManager: restored %d session history entries", len(self._session_history))
+        except Exception as exc:
+            logger.warning("SessionManager: failed to load session history: %s", exc)
+
+    def _save_session_history(self) -> None:
+        """Persist session history to disk."""
+        import json
+        try:
+            entries = [
+                {"ts": ts.isoformat(), "delta": delta}
+                for ts, delta in self._session_history
+            ]
+            with open(self._history_path, "w") as f:
+                json.dump(entries, f)
+        except Exception as exc:
+            logger.warning("SessionManager: failed to save session history: %s", exc)
 
     # ------------------------------------------------------------------
     # Model loading
@@ -200,6 +280,22 @@ class SessionManager:
             period, MODELS_DIR,
         )
 
+    def _load_ensemble(self) -> None:
+        """Load the multi-period ensemble bundle."""
+        path = MODELS_DIR / "poly_direction_ensemble.pkl"
+        if path.exists():
+            try:
+                with open(path, "rb") as f:
+                    self._ensemble = pickle.load(f)
+                logger.info("SessionManager: loaded ensemble (%d periods)",
+                            len(self._ensemble.get("periods", [])))
+            except Exception as exc:
+                logger.warning("SessionManager: failed to load ensemble: %s — falling back to 1h", exc)
+                self._load_model("1h")
+        else:
+            logger.warning("SessionManager: ensemble not found — falling back to 1h")
+            self._load_model("1h")
+
     def update_vix(self, vix_level: float, vix_percentile: float, vixy_level: float = 0.0) -> None:
         """Update market regime; reload model if regime boundary crossed."""
         old_regime           = "high" if self._vix_level >= 20 else "low"
@@ -207,9 +303,22 @@ class SessionManager:
         self._vix_level      = vix_level
         self._vix_percentile = vix_percentile
         self._vixy_level     = vixy_level
-        if old_regime != new_regime:
+        if old_regime != new_regime and self._ensemble is None:
             logger.info("VIX regime change (%s → %s); reloading model", old_regime, new_regime)
             self._load_model(self._model_period)
+
+    def update_spy_context(
+        self,
+        spy_ret_1h: float,
+        spy_ret_4h: float,
+        spy_range_pct: float,
+        spy_dist_from_open_pct: float,
+    ) -> None:
+        """Inject current SPY context (call periodically from main loop)."""
+        self._spy_ret_1h             = spy_ret_1h
+        self._spy_ret_4h             = spy_ret_4h
+        self._spy_range_pct          = spy_range_pct
+        self._spy_dist_from_open_pct = spy_dist_from_open_pct
 
     # ------------------------------------------------------------------
     # Event ingestion
@@ -253,6 +362,11 @@ class SessionManager:
 
         features = self._build_features(events, session_start)
         direction, confidence, holding = self._score(features)
+
+        # Record in session history for momentum features of future sessions
+        cum_delta = sum(e.price_delta for e in events)
+        self._session_history.append((session_start, cum_delta))
+        self._save_session_history()
 
         n_events = len(events)
         n_markets = len({e.market_id for e in events})
@@ -307,12 +421,30 @@ class SessionManager:
             __import__("zoneinfo").ZoneInfo("America/New_York")
         )
 
-        # Volume spike aggregation from raw events
-        # volume_spike_pct is computed live from Gamma 24h volume in _poll_and_detect
+        # Volume spike aggregation from raw events (0 if absent — matches training imputation)
         vol_spikes    = [e.volume_spike_pct for e in events if e.volume_spike_pct > 0]
         max_vol_spike = max(vol_spikes) if vol_spikes else 0.0
         avg_vol_spike = sum(vol_spikes) / len(vol_spikes) if vol_spikes else 0.0
         n_vol_spikes  = sum(1 for e in events if e.volume_spike_pct >= 50.0)
+
+        # Market quality features from metadata
+        session_cids = list({e.market_id for e in events})
+        mkt_vols = [self._market_vol.get(c, 0) for c in session_cids]
+        mkt_ages = [self._market_age.get(c, 0) for c in session_cids if c in self._market_age]
+
+        # Cross-session momentum from history buffer
+        now_ts = session_start
+        sessions_24h = 0
+        cum_delta_24h = 0.0
+        hours_since_last = 0.0
+        cutoff = now_ts - pd.Timedelta(hours=24)
+        for ts, delta in reversed(self._session_history):
+            if ts >= cutoff:
+                sessions_24h += 1
+                cum_delta_24h += delta
+        if self._session_history:
+            last_ts = self._session_history[-1][0]
+            hours_since_last = (now_ts - last_ts).total_seconds() / 3600
 
         feature_dict = {
             "max_price_delta":      max(abs(e.price_delta) for e in events),
@@ -339,6 +471,19 @@ class SessionManager:
             "is_market_hours":      int(9 <= local_ts.hour < 16 and local_ts.weekday() < 5),
             "hour_of_day":          local_ts.hour,
             "day_of_week":          local_ts.weekday(),
+            # SPY context features (injected by caller via update_spy_context)
+            "spy_ret_1h":             self._spy_ret_1h,
+            "spy_ret_4h":             self._spy_ret_4h,
+            "spy_range_pct":          self._spy_range_pct,
+            "spy_dist_from_open_pct": self._spy_dist_from_open_pct,
+            # Market quality features
+            "avg_market_volume":      float(np.mean(mkt_vols)) if mkt_vols else 0.0,
+            "max_market_volume":      float(np.max(mkt_vols)) if mkt_vols else 0.0,
+            "avg_market_age_days":    float(np.mean(mkt_ages)) if mkt_ages else 0.0,
+            # Cross-session momentum
+            "sessions_last_24h":        sessions_24h,
+            "cumulative_delta_24h":     cum_delta_24h,
+            "hours_since_last_session": hours_since_last,
         }
 
         # Validate that all expected features are present (catches drift early)
@@ -349,7 +494,18 @@ class SessionManager:
         return feature_dict
 
     def _score(self, feature_dict: dict) -> tuple[str, float, int]:
-        """Run L2 model → (direction, confidence, holding_period_minutes)."""
+        """Run L2 model → (direction, confidence, holding_period_minutes).
+
+        The model predicts P(whale signal direction is correct). When prob >= 0.5,
+        follow the whale signal (dominant_direction); otherwise fade it.
+
+        If ensemble is loaded, delegates to _score_ensemble.
+        """
+        # --- Ensemble scoring ---
+        if self._ensemble is not None:
+            return self._score_ensemble(feature_dict)
+
+        # --- Single-period scoring ---
         if self._model is None or self._features is None:
             return "HOLD", 0.0, 0
 
@@ -357,7 +513,15 @@ class SessionManager:
             row    = pd.DataFrame([{f: feature_dict.get(f, 0) for f in self._features}])
             prob   = float(self._model.predict_proba(row)[0, 1])
             conf   = max(prob, 1 - prob)   # distance from 0.5, regardless of direction
-            direction = "BUY" if prob >= 0.5 else "SHORT"
+
+            # prob >= 0.5 → signal is likely correct → follow dominant_direction
+            # prob <  0.5 → signal is likely wrong  → fade dominant_direction
+            dom_dir = feature_dict.get("dominant_direction", 1)
+            follow_signal = prob >= 0.5
+            if follow_signal:
+                direction = "BUY" if dom_dir > 0 else "SHORT"
+            else:
+                direction = "SHORT" if dom_dir > 0 else "BUY"
 
             if conf < self._min_confidence:
                 return "HOLD", conf, 0
@@ -370,6 +534,68 @@ class SessionManager:
         except Exception as exc:
             logger.warning("SessionManager scoring error: %s", exc)
             return "HOLD", 0.0, 0
+
+    def _score_ensemble(self, feature_dict: dict) -> tuple[str, float, int]:
+        """Run all period models and pick the best.
+
+        Each model predicts P(signal correct). Direction is derived from
+        dominant_direction + whether the model agrees the signal is correct.
+
+        Strategy: quality-weighted vote on direction, then select the agreeing
+        period with the highest weighted confidence.
+        """
+        period_map = self._ensemble.get("period_map", {})
+        models     = self._ensemble.get("models", {})
+        weights    = self._ensemble.get("quality_weights", {})
+        results    = []  # (period, direction, prob, conf, weight)
+
+        dom_dir = feature_dict.get("dominant_direction", 1)
+
+        for period, payload in models.items():
+            try:
+                feats = payload["features"]
+                model = payload["model"]
+                row   = pd.DataFrame([{f: feature_dict.get(f, 0) for f in feats}])
+                prob  = float(model.predict_proba(row)[0, 1])
+                conf  = max(prob, 1 - prob)
+                w     = weights.get(period, 1.0)
+
+                # prob >= 0.5 → follow signal, else fade
+                if prob >= 0.5:
+                    d = "BUY" if dom_dir > 0 else "SHORT"
+                else:
+                    d = "SHORT" if dom_dir > 0 else "BUY"
+
+                results.append((period, d, prob, conf, w))
+            except Exception as exc:
+                logger.debug("Ensemble %s scoring error: %s", period, exc)
+
+        if not results:
+            return "HOLD", 0.0, 0
+
+        # Quality-weighted vote on direction
+        buy_weight   = sum(w for _, d, _, _, w in results if d == "BUY")
+        short_weight = sum(w for _, d, _, _, w in results if d == "SHORT")
+        majority_dir = "BUY" if buy_weight >= short_weight else "SHORT"
+
+        # Among agreeing models, pick highest confidence (weighted)
+        agreeing = [(p, d, prob, c, w) for p, d, prob, c, w in results if d == majority_dir]
+        if not agreeing:
+            agreeing = results  # fallback: use all
+
+        best = max(agreeing, key=lambda x: x[3] * x[4])
+        best_period, direction, _, confidence, _ = best
+
+        if confidence < self._min_confidence:
+            return "HOLD", confidence, 0
+
+        holding = period_map.get(best_period, 60)
+
+        logger.debug(
+            "Ensemble: buy_w=%.2f short_w=%.2f → %s, best=%s (conf=%.3f), hold=%dm",
+            buy_weight, short_weight, majority_dir, best_period, confidence, holding,
+        )
+        return direction, confidence, holding
 
 
 # ---------------------------------------------------------------------------
@@ -455,6 +681,18 @@ class PolymarketScanner(BaseScanner):
     def update_vix(self, vix_level: float, vix_percentile: float, vixy_level: float = 0.0) -> None:
         """Inject current VIX/VIXY into the session manager (call periodically)."""
         self._session_mgr.update_vix(vix_level, vix_percentile, vixy_level)
+
+    def update_spy_context(
+        self,
+        spy_ret_1h: float,
+        spy_ret_4h: float,
+        spy_range_pct: float,
+        spy_dist_from_open_pct: float,
+    ) -> None:
+        """Inject current SPY context into session manager (call periodically)."""
+        self._session_mgr.update_spy_context(
+            spy_ret_1h, spy_ret_4h, spy_range_pct, spy_dist_from_open_pct,
+        )
 
     # ------------------------------------------------------------------
     # Watchlist discovery

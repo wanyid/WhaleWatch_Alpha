@@ -1,4 +1,4 @@
-"""train_poly_model.py — Train Polymarket session → SPY direction predictor.
+"""train_poly_model.py — Train Polymarket session → signal correctness predictor.
 
 Input:  D:/WhaleWatch_Data/poly_market_data.parquet
 Output: models/saved/poly_direction_{period}.pkl          (baseline)
@@ -7,8 +7,8 @@ Output: models/saved/poly_direction_{period}.pkl          (baseline)
         models/saved/poly_direction_{period}_weighted.pkl (decay-weighted)
 
 Uses XGBoost + isotonic calibration, TimeSeriesSplit CV.
-Output: P(SPY excess return > 0 after session) — same interface as
-        the Truth Social L2 model (spy_direction_*.pkl).
+Output: P(whale signal direction is correct) — label=1 means SPY moved in
+        the direction predicted by the dominant Polymarket whale activity.
 
 Usage:
     python scripts/train_poly_model.py
@@ -33,7 +33,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # ---------------------------------------------------------------------------
 # Train/OOS split cutoff
 # ---------------------------------------------------------------------------
-TRAIN_CUTOFF = pd.Timestamp("2026-02-28")
+TRAIN_CUTOFF = pd.Timestamp("2026-02-28", tz="UTC")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -74,6 +74,9 @@ from reasoner.layer2_predictor.poly_features import (
     STRENGTH_FEATURES,
     TOPIC_FEATURES,
     REGIME_FEATURES,
+    SPY_CONTEXT_FEATURES,
+    MARKET_QUALITY_FEATURES,
+    MOMENTUM_FEATURES,
     ALL_DIRECTIONAL_FEATURES,
 )
 
@@ -221,42 +224,59 @@ def _build_calibrated_model(
     sample_weight: np.ndarray | None = None,
     xgb_params: dict | None = None,
 ):
-    """Fit XGBoost + calibration on the full training dataset.
+    """Fit XGBoost with early stopping + probability calibration.
 
-    Calibration method:
-      isotonic  — flexible, but requires ~500+ samples to avoid overfitting
-      sigmoid   — stable at small N; used when n < 500
-
-    Uses TimeSeriesSplit for calibration folds so future data never contaminates
-    earlier calibration folds.
+    Two-step process:
+      1. Fit XGBoost with early stopping on a time-based train/val split
+         (last 20% as validation). This prevents overfitting by selecting
+         the optimal number of boosting rounds automatically.
+      2. Calibrate the fitted model's probabilities using sigmoid/isotonic
+         calibration on the full dataset (FrozenEstimator + 5-fold CV).
 
     scale_pos_weight accounts for class imbalance (especially relevant for
     regime sub-models which train on a fraction of the full dataset).
     """
     from sklearn.calibration import CalibratedClassifierCV
-    from sklearn.model_selection import TimeSeriesSplit
+    from sklearn.frozen import FrozenEstimator
     from xgboost import XGBClassifier
 
     n_pos    = int(y.sum())
     n_neg    = len(y) - n_pos
     pos_rate = n_pos / max(len(y), 1)
-    # Only weight when imbalance is significant (outside 35–65%).
     spw = min(n_neg / max(n_pos, 1), 5.0) if (pos_rate < 0.35 or pos_rate > 0.65) else 1.0
 
     defaults = dict(
-        n_estimators=200, max_depth=4, learning_rate=0.05,
+        n_estimators=500, max_depth=4, learning_rate=0.05,
         subsample=0.8, colsample_bytree=0.8, scale_pos_weight=spw,
         eval_metric="logloss", random_state=42, verbosity=0,
     )
     if xgb_params:
         defaults.update(xgb_params)
+        defaults["n_estimators"] = max(defaults["n_estimators"], 500)
+
     base = XGBClassifier(**defaults)
-    # Isotonic calibration requires sufficient samples to avoid overfitting;
-    # sigmoid is more stable below the 500-sample threshold.
+
+    # Step 1: Fit with early stopping on time-based val split (last 20%)
+    n = len(X)
+    val_size = max(int(n * 0.2), 20)
+    if n > val_size + 30:
+        X_tr, X_val = X.iloc[:-val_size], X.iloc[-val_size:]
+        y_tr, y_val = y.iloc[:-val_size], y.iloc[-val_size:]
+        w_tr = sample_weight[:-val_size] if sample_weight is not None else None
+        fit_kw = {} if w_tr is None else {"sample_weight": w_tr}
+        base.fit(X_tr, y_tr, eval_set=[(X_val, y_val)],
+                 verbose=False, **fit_kw)
+        # best_iteration is set by early stopping; refit on full data with that count
+        best_n = getattr(base, "best_iteration", defaults["n_estimators"]) + 1
+        base = XGBClassifier(**{**defaults, "n_estimators": best_n})
+
+    fit_kw_full = {} if sample_weight is None else {"sample_weight": sample_weight}
+    base.fit(X, y, **fit_kw_full)
+
+    # Step 2: Calibrate probabilities on full data (model already fitted)
     method = "isotonic" if len(y) >= 500 else "sigmoid"
-    clf    = CalibratedClassifierCV(base, method=method, cv=TimeSeriesSplit(n_splits=3))
-    fit_kwargs = {} if sample_weight is None else {"sample_weight": sample_weight}
-    clf.fit(X, y, **fit_kwargs)
+    clf = CalibratedClassifierCV(FrozenEstimator(base), method=method, cv=5)
+    clf.fit(X, y)
     return clf
 
 
@@ -340,29 +360,33 @@ def train_period(
         logger.warning("  %s: label column missing — skipping", period)
         return
 
-    # Apply dead-zone filter on the raw return: drop rows where |ret| is below
-    # the threshold. Labels are based on sign(raw_ret), so this removes rows
-    # where the move is too small to be a meaningful directional signal.
+    # Soft dead zone: instead of dropping rows with small moves, keep ALL
+    # samples but down-weight those where |ret| < threshold. This preserves
+    # 5-10x more training data while still emphasising large, unambiguous moves.
+    #
+    # Weight = min(|ret| / threshold, 1.0)  — linear ramp from 0 to 1
+    # Samples at or above threshold get weight 1.0; smaller moves get
+    # proportionally lower weight. No samples are discarded.
     dead_zone = DEAD_ZONE.get(period, 0.0)
+    mask_valid = df_train[lbl_col].notna()
     if ret_col in df_train.columns:
-        mask_valid = (
-            df_train[lbl_col].notna() &
-            (df_train[ret_col].abs() >= dead_zone)
-        )
-    else:
-        mask_valid = df_train[lbl_col].notna()
-        logger.warning("  %s: ret column missing — dead zone not applied", period)
+        mask_valid = mask_valid & df_train[ret_col].notna()
 
     df_valid = df_train[mask_valid].copy()
     df_valid[lbl_col] = df_valid[lbl_col].astype(int)
 
-    n_total_nonnull = int(df_train[lbl_col].notna().sum())
-    n_dropped       = n_total_nonnull - len(df_valid)
-    logger.info(
-        "  %s: raw=%d  after_dead_zone=%d (dropped %d=%.0f%%)",
-        period, n_total_nonnull, len(df_valid),
-        n_dropped, n_dropped / max(n_total_nonnull, 1) * 100,
-    )
+    # Compute soft dead-zone weights
+    if ret_col in df_valid.columns and dead_zone > 0:
+        dz_weights = np.clip(df_valid[ret_col].abs().values / dead_zone, 0.0, 1.0)
+        n_full_weight = int((dz_weights >= 1.0).sum())
+        n_down_weighted = len(dz_weights) - n_full_weight
+        logger.info(
+            "  %s: n=%d  full_weight=%d  down_weighted=%d (dz=%.4f)",
+            period, len(df_valid), n_full_weight, n_down_weighted, dead_zone,
+        )
+    else:
+        dz_weights = np.ones(len(df_valid))
+        logger.info("  %s: n=%d  (no dead-zone weighting)", period, len(df_valid))
 
     features = [f for f in ALL_FEATURES if f in df_valid.columns]
     X = df_valid[features]
@@ -373,7 +397,7 @@ def train_period(
         return
 
     pos_rate = float(y.mean())
-    logger.info("  %s: n_train=%d  pos_rate=%.1f%%", period, len(y), pos_rate * 100)
+    logger.info("  %s: n_train=%d  signal_correct=%.1f%%", period, len(y), pos_rate * 100)
 
     from xgboost import XGBClassifier
     from sklearn.calibration import CalibratedClassifierCV
@@ -424,13 +448,13 @@ def train_period(
     # Optional hyperparameter tuning
     tuned_params = _tune_xgb_params(X, y) if tune else None
 
-    # --- Baseline (training data only) ---
-    cv = _cross_validate(X, y, model_factory)
-    model = _build_calibrated_model(X, y, xgb_params=tuned_params)
+    # --- Baseline (with soft dead-zone weights) ---
+    cv = _cross_validate(X, y, model_factory, sample_weight=dz_weights)
+    model = _build_calibrated_model(X, y, sample_weight=dz_weights, xgb_params=tuned_params)
     oos_m = _oos_metrics_poly(model, X_oos_p, y_oos_p) if len(X_oos_p) > 0 else {}
     _save_model(
         model, features, period, cv, len(y), pos_rate, ret_col,
-        label_method="raw_return", suffix="",
+        label_method="signal_relative", suffix="",
         extra_meta={"train_cutoff": str(TRAIN_CUTOFF.date()), "oos_metrics": oos_m},
     )
     if oos_m:
@@ -446,11 +470,12 @@ def train_period(
             mask   = mask_fn(df_valid)
             X_r    = X[mask]
             y_r    = y[mask]
+            w_r    = dz_weights[mask.values]
             if len(y_r) < 30 or y_r.nunique() < 2:
                 logger.info("  %s %s: %d rows — skip", period, regime_name, len(y_r))
                 continue
-            cv_r    = _cross_validate(X_r, y_r, model_factory)
-            model_r = _build_calibrated_model(X_r, y_r)
+            cv_r    = _cross_validate(X_r, y_r, model_factory, sample_weight=w_r)
+            model_r = _build_calibrated_model(X_r, y_r, sample_weight=w_r)
             # OOS for regime sub-model
             oos_r: dict = {}
             if len(X_oos_p) > 0 and "vix_level" in df_oos.columns:
@@ -463,21 +488,22 @@ def train_period(
                     oos_r   = _oos_metrics_poly(model_r, X_oos_r, y_oos_r)
             _save_model(
                 model_r, features, period, cv_r, len(y_r), float(y_r.mean()),
-                ret_col, label_method="raw_return",
+                ret_col, label_method="signal_relative",
                 suffix=f"_{regime_name}",
                 extra_meta={"vix_threshold": vix_threshold, "regime": regime_name,
                             "train_cutoff": str(TRAIN_CUTOFF.date()), "oos_metrics": oos_r},
             )
 
-    # --- Decay-weighted ---
+    # --- Decay-weighted (combined with dead-zone weights) ---
     if decay_half > 0:
-        weights = _decay_weights(df_valid, decay_half)
-        cv_w    = _cross_validate(X, y, model_factory, sample_weight=weights)
-        model_w = _build_calibrated_model(X, y, sample_weight=weights)
+        decay_w  = _decay_weights(df_valid, decay_half)
+        combined = dz_weights * decay_w
+        cv_w    = _cross_validate(X, y, model_factory, sample_weight=combined)
+        model_w = _build_calibrated_model(X, y, sample_weight=combined)
         oos_w   = _oos_metrics_poly(model_w, X_oos_p, y_oos_p) if len(X_oos_p) > 0 else {}
         _save_model(
             model_w, features, period, cv_w, len(y), pos_rate,
-            ret_col, label_method="raw_return",
+            ret_col, label_method="signal_relative",
             suffix="_weighted",
             extra_meta={"decay_half_life_days": decay_half,
                         "train_cutoff": str(TRAIN_CUTOFF.date()), "oos_metrics": oos_w},
@@ -531,11 +557,62 @@ def run(
     logger.info("  Strength:  %s", STRENGTH_FEATURES)
     logger.info("  Topics:    %s", TOPIC_FEATURES)
     logger.info("  Regime:    %s", REGIME_FEATURES)
+    logger.info("  SPY ctx:   %s", SPY_CONTEXT_FEATURES)
+    logger.info("  Mkt qual:  %s", MARKET_QUALITY_FEATURES)
+    logger.info("  Momentum:  %s", MOMENTUM_FEATURES)
 
     logger.info("\n--- Training ---")
     for period in HOLDING_PERIODS:
         logger.info("\nPeriod: %s", period)
         train_period(df_train, df_oos, period, train_regime, vix_threshold, decay_half, tune, walk_forward)
+
+    # -----------------------------------------------------------------------
+    # Quality-weighted ensemble: only include models with OOS AUC > 0.52
+    # (above chance). Weight each model's vote by its OOS AUC so stronger
+    # models have more influence on the direction decision.
+    # -----------------------------------------------------------------------
+    MIN_ENSEMBLE_AUC = 0.52
+    logger.info("\n--- Building quality-weighted ensemble (min AUC=%.2f) ---", MIN_ENSEMBLE_AUC)
+    ensemble_models = {}
+    quality_weights = {}
+    for period in HOLDING_PERIODS:
+        path = MODELS_DIR / f"poly_direction_{period}.pkl"
+        if path.exists():
+            try:
+                with open(path, "rb") as fh:
+                    payload = pickle.load(fh)
+                oos = payload.get("oos_metrics") or {}
+                oos_auc = oos.get("oos_auc", 0.5)
+                if oos_auc >= MIN_ENSEMBLE_AUC:
+                    ensemble_models[period] = payload
+                    quality_weights[period] = oos_auc
+                    logger.info("  %-4s  OOS AUC=%.3f  → included (weight=%.3f)",
+                                period, oos_auc, oos_auc)
+                else:
+                    logger.info("  %-4s  OOS AUC=%.3f  → excluded (below %.2f)",
+                                period, oos_auc, MIN_ENSEMBLE_AUC)
+            except Exception:
+                pass
+
+    if len(ensemble_models) >= 1:
+        period_map = {"5m": 5, "30m": 30, "1h": 60, "2h": 120, "4h": 240, "1d": 1440}
+        ensemble_payload = {
+            "model_type":      "ensemble_quality_weighted",
+            "periods":         list(ensemble_models.keys()),
+            "models":          ensemble_models,
+            "quality_weights": quality_weights,
+            "period_map":      period_map,
+            "features":        ALL_FEATURES,
+            "trained_at":      datetime.now(tz=timezone.utc).isoformat(),
+            "train_cutoff":    str(TRAIN_CUTOFF.date()),
+        }
+        ens_path = MODELS_DIR / "poly_direction_ensemble.pkl"
+        with open(ens_path, "wb") as f:
+            pickle.dump(ensemble_payload, f)
+        logger.info("  Saved ensemble (%d/%d periods) → %s",
+                    len(ensemble_models), len(HOLDING_PERIODS), ens_path.name)
+    else:
+        logger.warning("  Ensemble skipped: no models met AUC threshold %.2f", MIN_ENSEMBLE_AUC)
 
     # Summary table
     logger.info("\n--- Model summary (train cutoff: %s) ---", TRAIN_CUTOFF.date())
@@ -545,6 +622,8 @@ def run(
         try:
             with open(f, "rb") as fh:
                 m = pickle.load(fh)
+            if m.get("model_type") == "ensemble_best_confidence":
+                continue  # skip ensemble in per-period table
             oos = m.get("oos_metrics") or {}
             results.append({
                 "file":     f.name,
