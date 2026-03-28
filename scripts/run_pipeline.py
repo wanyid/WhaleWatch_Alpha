@@ -100,23 +100,42 @@ def run_step(script_name: str, extra_args: list) -> bool:
             proc = subprocess.Popen(cmd, stdout=out_fh, stderr=out_fh, env=env)
 
             if is_history:
-                # Watchdog thread: monitors log size; kills proc if silent too long
+                # Watchdog thread: monitors progress marker + log size.
+                # Windows NTFS caches file metadata so HISTORY_LOG.stat().st_size
+                # can appear stale even while the subprocess is writing. The pull
+                # script writes a .pull_progress marker (plain write_text, flushed)
+                # before each market fetch, so we check BOTH sources of liveness.
                 killed_by_watchdog = threading.Event()
+                PROGRESS_FILE = Path("D:/WhaleWatch_Data/polymarket/.pull_progress")
 
                 def _watchdog():
                     last_size = 0
+                    last_mtime = 0.0
                     last_active = time.time()
                     while proc.poll() is None:
                         time.sleep(30)
+                        changed = False
+                        # Check log file size
                         try:
                             cur_size = HISTORY_LOG.stat().st_size
                         except OSError:
                             cur_size = 0
                         if cur_size > last_size:
                             last_size = cur_size
+                            changed = True
+                        # Check progress marker mtime (more reliable on Windows)
+                        try:
+                            cur_mtime = PROGRESS_FILE.stat().st_mtime
+                        except OSError:
+                            cur_mtime = 0.0
+                        if cur_mtime > last_mtime:
+                            last_mtime = cur_mtime
+                            changed = True
+
+                        if changed:
                             last_active = time.time()
                         elif time.time() - last_active > STALL_SECS:
-                            log(f"WATCHDOG: no log activity for {STALL_SECS}s — killing stalled process")
+                            log(f"WATCHDOG: no activity for {STALL_SECS}s — killing stalled process")
                             try:
                                 proc.kill()
                             except Exception:
