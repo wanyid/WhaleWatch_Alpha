@@ -44,6 +44,12 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+# Force-flush after every log write.  On Windows, PYTHONUNBUFFERED=1 alone does
+# not guarantee that inherited file descriptors (from subprocess.Popen) flush to
+# disk — the OS handle may buffer writes, starving the external watchdog and
+# making tail/stat useless for monitoring.
+for _h in logging.root.handlers:
+    _h.flush = lambda _orig=_h.flush: (_orig(), sys.stderr.flush(), sys.stdout.flush())
 logger = logging.getLogger("pull_poly_history")
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
@@ -56,9 +62,10 @@ DEFAULT_START   = "2024-01-01"
 DEFAULT_MIN_VOL = 50_000     # USD total volume — filters out thin markets
 CALL_SLEEP_SEC  = 0.5        # generous; Polymarket has no stated rate limit
 
-# Polymarket CLOB prices-history silently caps responses to ~28 days of bars
-# regardless of start_ts when fidelity=60. Chunked requests work around this.
-CHUNK_DAYS = 25              # request window size — kept under the 28-day cap
+# Polymarket CLOB prices-history rejects intervals > ~15 days with HTTP 400
+# ("interval is too long").  Previously the limit was ~28 days; it was lowered
+# server-side sometime before 2026-03-27.  Use 14 days for safety margin.
+CHUNK_DAYS = 14              # request window size — kept under the 15-day cap
 
 # ---------------------------------------------------------------------------
 # Topic bucket classification
